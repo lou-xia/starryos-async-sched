@@ -314,3 +314,37 @@ fn init_tls() {
     unsafe { axhal::asm::write_thread_pointer(main_tls.tls_ptr() as usize) };
     core::mem::forget(main_tls);
 }
+
+use core::arch::asm;
+
+#[unsafe(link_section = ".bss.stack")]
+pub(crate) static mut BOOT_STACK: [u8; axconfig::TASK_STACK_SIZE] = [0; axconfig::TASK_STACK_SIZE];
+
+#[unsafe(no_mangle)]
+pub extern "C" fn current_boot_stack() -> *mut u8 {
+    unsafe {
+        let sp: usize;
+
+        #[cfg(target_arch = "x86_64")]
+        asm!("mov {}, rsp", out(reg) sp);
+
+        #[cfg(target_arch = "aarch64")]
+        asm!("mov {}, sp", out(reg) sp);
+
+        #[cfg(target_arch = "riscv64")]
+        asm!("mv {}, sp", out(reg) sp);
+
+        let stack_low = &raw const BOOT_STACK as usize;
+        let stack_high = stack_low + axconfig::TASK_STACK_SIZE;
+
+        if sp >= stack_low && sp < stack_high {
+            debug!("get sp {:#x} in boot_stack", sp);
+            return &raw mut BOOT_STACK as *mut u8;
+        }
+
+        #[cfg(feature = "smp")]
+        return mp::mp_boot_stack(sp);
+        #[cfg(not(feature = "smp"))]
+        return 0 as *mut u8;
+    }
+}

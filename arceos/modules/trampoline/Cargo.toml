@@ -1,0 +1,75 @@
+[package]
+name = "trampoline"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = ["multitask", "smp", "irq", "thread", "preempt"]
+
+#thread = ["taskctx/thread", "sync/thread", "executor/thread", "task_api/thread"]
+#
+#multitask = []
+#
+#monolithic = ["taskctx/thread", "irq", "multitask", "preempt"]
+#
+#irq = ["sync/irq", "executor/irq", "axhal/irq", "task_api/irq"]
+#
+#smp = ["spinlock/smp", "executor/smp"]
+#
+#preempt = [
+#    "irq",
+#    "percpu/preempt",
+#    "kernel_guard/preempt",
+#    "executor/preempt",
+#    "taskctx/preempt",
+#]
+#
+#sched_fifo = ["multitask", "executor/sched_fifo"]
+#sched_rr = ["multitask", "executor/sched_rr", "preempt"]
+#sched_cfs = ["multitask", "executor/sched_cfs", "preempt"]
+#sched_taic = ["multitask", "executor/sched_taic", "syscall/sched_taic"]
+
+multitask = []
+smp = []
+irq = []
+thread = []
+preempt = []
+
+[dependencies]
+log = "0.4"
+lazyinit = { workspace = true }
+kspin = { workspace = true }
+kernel_guard = { workspace = true }
+percpu = { workspace = true }
+axerrno = "0.2"
+axconfig = { workspace = true }
+spin = "0.10.0"
+crate_interface.workspace = true
+syscalls = { version = "0.6", default-features = false }
+
+asynctask.workspace = true
+axsync = { workspace = true }
+#executor = { path = "../executor" }
+axhal = { workspace = true }
+#syscall = { path = "../syscall" }
+#async_mem = { path = "../async_mem" }
+#async_fs = { path = "../async_fs" }
+#taic-driver = { git = "https://github.com/taic-repo/taic-driver.git" }
+
+
+[target.'cfg(any(target_arch = "riscv32", target_arch = "riscv64"))'.dependencies]
+riscv = "0.11"
+
+cfg-if = "1.0"
+axlog = { git = "https://github.com/Starry-Old/axlog.git" }
+# axnet = { git = "https://github.com/Starry-OS/axnet.git" }
+starry-signal = "0.2.4-preview.1"
+axconfig = { workspace = true }
+# axfutex = { git = "https://github.com/Starry-OS/axfutex.git"}
+numeric-enum-macro = { git = "https://github.com/mexus/numeric-enum-macro" }
+bitflags = "2.6"
+rand = { version = "0.8.5", default-features = false, features = ["small_rng"] }
+num_enum = { version = "0.5.11", default-features = false }
+async-trait = "0.1.83"
+
+#async_io = { path = "../async_io" }

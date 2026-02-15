@@ -1,0 +1,38 @@
+[package]
+name = "asynctask"
+version.workspace = true
+edition.workspace = true
+
+[features]
+
+default = ["thread", "preempt", "sched_fifo", "tls", "irq"]
+
+thread = []
+preempt = ["thread"]
+sched_fifo = []
+sched_rr = ["preempt"]
+sched_cfs = ["preempt"]
+tls = []
+irq = []
+
+[dependencies]
+log = "0.4"
+cfg-if = "1.0"
+static_assertions = "1.1.0"
+memory_addr = { workspace = true }
+lazyinit = { workspace = true }
+numeric-enum-macro = { git = "https://github.com/mexus/numeric-enum-macro" }
+axconfig = { workspace = true }
+kspin = { workspace = true }
+percpu = { workspace = true }
+
+axhal = { workspace = true }
+crate_interface = { workspace = true }
+kernel_guard = { workspace = true }
+axsched = { version = "0.3" }
+timer_list = { git = "https://github.com/Starry-OS/timer_list.git" }
+linked_list = { git = "https://github.com/Starry-OS/linked_list.git" }
+
+[target.'cfg(any(target_arch = "riscv32", target_arch = "riscv64"))'.dependencies]
+riscv = "0.11"
+sbi-rt = { version = "0.0.3", features = ["legacy"] }

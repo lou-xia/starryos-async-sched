@@ -29,6 +29,20 @@ pub fn start_secondary_cpus(primary_cpu_id: usize) {
     }
 }
 
+pub(crate) unsafe fn mp_boot_stack(sp: usize) -> *mut u8 {
+    for i in 0..CPU_NUM {
+        let stack_low = unsafe { SECONDARY_BOOT_STACK }[i].as_ptr() as usize;
+        let stack_high = stack_low + TASK_STACK_SIZE;
+
+        if sp >= stack_low && sp < stack_high {
+            info!("get sp {:#x} in second boot_stack", sp);
+            return unsafe { SECONDARY_BOOT_STACK }[i].as_mut_ptr();
+        }
+    }
+    return 0 as *mut u8;
+}
+
+
 /// The main entry point of the ArceOS runtime for secondary cores.
 ///
 /// It is called from the bootstrapping code in the specific platform crate.

@@ -30,6 +30,9 @@ members = [
     "examples/httpclient",
     "examples/httpserver",
     "examples/shell",
+
+    "modules/asynctask",
+    "modules/trampoline",
 ]
 
 [workspace.package]
@@ -66,6 +69,9 @@ axnet = { path = "modules/axnet" }
 axruntime = { path = "modules/axruntime" }
 axsync = { path = "modules/axsync" }
 axtask = { path = "modules/axtask" }
+
+asynctask = { path = "modules/asynctask" }
+trampoline = { path = "modules/trampoline" }
 
 allocator = { git = "https://github.com/arceos-org/allocator.git", tag = "v0.1.2", features = [
     "axerrno",
