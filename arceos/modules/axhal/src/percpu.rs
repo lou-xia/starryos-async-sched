@@ -54,3 +54,52 @@ pub unsafe fn set_current_task_ptr<T>(ptr: *const T) {
         unsafe { CURRENT_TASK_PTR.write_current_raw(ptr as usize) }
     }
 }
+
+
+// #[percpu::def_percpu]
+// static CURRENT_EXECUTOR_PTR: usize = 0;
+// #[inline]
+// pub fn current_executor_ptr<T>() -> *const T {
+//     #[cfg(target_arch = "x86_64")]
+//     unsafe {
+//         // on x86, only one instruction is needed to read the per-CPU executor pointer from `gs:[off]`.
+//         CURRENT_EXECUTOR_PTR.read_current_raw() as _
+//     }
+//     #[cfg(any(
+//         target_arch = "aarch64",
+//         target_arch = "riscv32",
+//         target_arch = "riscv64",
+//         target_arch = "loongarch64"
+//     ))]
+//     unsafe {
+//         // on RISC-V and LA64, reading `CURRENT_EXECUTOR_PTR` requires multiple instruction, so we disable local IRQs.
+//         let _guard = kernel_guard::IrqSave::new();
+//         CURRENT_EXECUTOR_PTR.read_current_raw() as _
+//     }
+// }
+
+// /// Sets the pointer to the current executor with preemption-safety.
+// ///
+// /// Preemption may be enabled when calling this function. This function will
+// /// guarantee the correctness even the current executor is preempted.
+// ///
+// /// # Safety
+// ///
+// /// The given `ptr` must be pointed to a valid executor structure.
+// #[inline]
+// pub unsafe fn set_current_executor_ptr<T>(ptr: *const T) {
+//     #[cfg(target_arch = "x86_64")]
+//     {
+//         unsafe { CURRENT_EXECUTOR_PTR.write_current_raw(ptr as usize) }
+//     }
+//     #[cfg(any(
+//         target_arch = "aarch64",
+//         target_arch = "riscv32",
+//         target_arch = "riscv64",
+//         target_arch = "loongarch64"
+//     ))]
+//     {
+//         let _guard = kernel_guard::IrqSave::new();
+//         unsafe { CURRENT_EXECUTOR_PTR.write_current_raw(ptr as usize) }
+//     }
+// }

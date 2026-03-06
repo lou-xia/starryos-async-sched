@@ -2,33 +2,30 @@
 use crate::TaskStack;
 use crate::{stat::TimeStat, Scheduler, TrapFrame};
 use alloc::{boxed::Box, collections::vec_deque::VecDeque, string::String, sync::Arc};
-#[cfg(feature = "preempt")]
-use core::sync::atomic::AtomicUsize;
 use core::{
     cell::UnsafeCell,
     fmt,
     future::Future,
     mem::ManuallyDrop,
     pin::Pin,
-    sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering},
     task::Waker,
 };
 use kspin::{SpinNoIrq, SpinNoIrqGuard};
 
 /// A unique identifier for a thread.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct TaskId(u64);
+pub struct TaskId(usize);
 
-static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+static ID_COUNTER: AtomicUsize = AtomicUsize::new(1);
 impl TaskId {
     /// Create a new task ID.
     pub fn new() -> Self {
         Self(ID_COUNTER.fetch_add(1, Ordering::Relaxed))
     }
 
-    /// Convert the task ID to a `u64`.
-    pub const fn as_u64(&self) -> u64 {
-        self.0
+    pub const fn as_usize(&self) -> usize {
+        self.0 as usize
     }
 }
 
@@ -124,8 +121,8 @@ pub struct TaskInner {
     pub(crate) state: SpinNoIrq<TaskState>,
     time: UnsafeCell<TimeStat>,
     exit_code: AtomicIsize,
-    set_child_tid: AtomicU64,
-    clear_child_tid: AtomicU64,
+    set_child_tid: AtomicUsize,
+    clear_child_tid: AtomicUsize,
     #[cfg(feature = "preempt")]
     /// Whether the task needs to be rescheduled
     ///
@@ -146,12 +143,12 @@ pub struct TaskInner {
 
     /// 是否是所属进程下的主线程
     is_leader: AtomicBool,
-    process_id: AtomicU64,
+    process_id: AtomicUsize,
     pub page_table_token: UnsafeCell<usize>,
 
     /// The scheduler status of the task, which defines the scheduling policy and priority
     pub sched_status: UnsafeCell<SchedStatus>,
-    pub cpu_set: AtomicU64,
+    pub cpu_set: AtomicUsize,
 }
 
 unsafe impl Send for TaskInner {}
@@ -160,7 +157,7 @@ unsafe impl Sync for TaskInner {}
 impl TaskInner {
     pub fn new(
         name: String,
-        process_id: u64,
+        process_id: usize,
         scheduler: Arc<SpinNoIrq<Scheduler>>,
         page_table_token: usize,
         fut: Pin<Box<dyn Future<Output = isize> + 'static>>,
@@ -177,14 +174,14 @@ impl TaskInner {
             scheduler: SpinNoIrq::new(scheduler),
             state: SpinNoIrq::new(TaskState::Runable),
             time: UnsafeCell::new(TimeStat::new()),
-            set_child_tid: AtomicU64::new(0),
-            clear_child_tid: AtomicU64::new(0),
+            set_child_tid: AtomicUsize::new(0),
+            clear_child_tid: AtomicUsize::new(0),
             #[cfg(feature = "preempt")]
             need_resched: AtomicBool::new(false),
             #[cfg(feature = "preempt")]
             preempt_disable_count: AtomicUsize::new(0),
             is_leader: AtomicBool::new(false),
-            process_id: AtomicU64::new(process_id),
+            process_id: AtomicUsize::new(process_id),
             page_table_token: UnsafeCell::new(page_table_token),
             #[cfg(feature = "thread")]
             stack_ctx: UnsafeCell::new(None),
@@ -192,7 +189,7 @@ impl TaskInner {
                 policy: SchedPolicy::SCHED_FIFO,
                 priority: 1,
             }),
-            cpu_set: AtomicU64::new(0),
+            cpu_set: AtomicUsize::new(0),
         };
         t.set_cpu_set((1 << axconfig::plat::CPU_NUM) - 1, 1, axconfig::plat::CPU_NUM);
         t
@@ -200,7 +197,7 @@ impl TaskInner {
 
     pub fn new_user(
         name: String,
-        process_id: u64,
+        process_id: usize,
         scheduler: Arc<SpinNoIrq<Scheduler>>,
         page_table_token: usize,
         fut: Pin<Box<dyn Future<Output = isize> + 'static>>,
@@ -218,14 +215,14 @@ impl TaskInner {
             scheduler: SpinNoIrq::new(scheduler),
             state: SpinNoIrq::new(TaskState::Runable),
             time: UnsafeCell::new(TimeStat::new()),
-            set_child_tid: AtomicU64::new(0),
-            clear_child_tid: AtomicU64::new(0),
+            set_child_tid: AtomicUsize::new(0),
+            clear_child_tid: AtomicUsize::new(0),
             #[cfg(feature = "preempt")]
             need_resched: AtomicBool::new(false),
             #[cfg(feature = "preempt")]
             preempt_disable_count: AtomicUsize::new(0),
             is_leader: AtomicBool::new(false),
-            process_id: AtomicU64::new(process_id),
+            process_id: AtomicUsize::new(process_id),
             page_table_token: UnsafeCell::new(page_table_token),
             #[cfg(feature = "thread")]
             stack_ctx: UnsafeCell::new(None),
@@ -233,7 +230,7 @@ impl TaskInner {
                 policy: SchedPolicy::SCHED_FIFO,
                 priority: 1,
             }),
-            cpu_set: AtomicU64::new(0),
+            cpu_set: AtomicUsize::new(0),
         };
         t.set_cpu_set((1 << axconfig::plat::CPU_NUM) - 1, 1, axconfig::plat::CPU_NUM);
         t
@@ -263,7 +260,7 @@ impl TaskInner {
 
     /// Get a combined string of the task ID and name.
     pub fn id_name(&self) -> alloc::string::String {
-        alloc::format!("Task({}, {:?})", self.id.as_u64(), self.name())
+        alloc::format!("Task({}, {:?})", self.id.as_usize(), self.name())
     }
 
     /// Whether the task has been inited
@@ -294,7 +291,7 @@ impl TaskInner {
             set_size * 4
         };
         let now_mask = mask & 1 << ((len) - 1);
-        self.cpu_set.store(now_mask as u64, Ordering::Release)
+        self.cpu_set.store(now_mask, Ordering::Release)
     }
 
     /// to get the CPU set
@@ -366,12 +363,12 @@ impl TaskInner {
 
     /// store the child thread ID at the location pointed to by child_tid in clone args
     pub fn set_child_tid(&self, tid: usize) {
-        self.set_child_tid.store(tid as u64, Ordering::Release)
+        self.set_child_tid.store(tid, Ordering::Release)
     }
 
     /// clear (zero) the child thread ID at the location pointed to by child_tid in clone args
     pub fn set_clear_child_tid(&self, tid: usize) {
-        self.clear_child_tid.store(tid as u64, Ordering::Release)
+        self.clear_child_tid.store(tid, Ordering::Release)
     }
 
     /// get the pointer to the child thread ID
@@ -391,13 +388,13 @@ impl TaskInner {
 
     #[inline]
     /// get the process ID of the task
-    pub fn get_process_id(&self) -> u64 {
+    pub fn get_process_id(&self) -> usize {
         self.process_id.load(Ordering::Acquire)
     }
 
     #[inline]
     /// set the process ID of the task
-    pub fn set_process_id(&self, process_id: u64) {
+    pub fn set_process_id(&self, process_id: usize) {
         self.process_id.store(process_id, Ordering::Release);
     }
 
@@ -446,7 +443,7 @@ impl TaskInner {
     pub fn time_stat_from_user_to_kernel(&self, current_tick: usize) {
         let time = self.time.get();
         unsafe {
-            (*time).switch_into_kernel_mode(self.id.as_u64() as isize, current_tick);
+            (*time).switch_into_kernel_mode(self.id.as_usize() as isize, current_tick);
         }
     }
 
@@ -455,7 +452,7 @@ impl TaskInner {
     pub fn time_stat_from_kernel_to_user(&self, current_tick: usize) {
         let time = self.time.get();
         unsafe {
-            (*time).switch_into_user_mode(self.id.as_u64() as isize, current_tick);
+            (*time).switch_into_user_mode(self.id.as_usize() as isize, current_tick);
         }
     }
 
@@ -464,7 +461,7 @@ impl TaskInner {
     pub fn time_stat_when_switch_from(&self, current_tick: usize) {
         let time = self.time.get();
         unsafe {
-            (*time).swtich_from_old_task(self.id.as_u64() as isize, current_tick);
+            (*time).swtich_from_old_task(self.id.as_usize() as isize, current_tick);
         }
     }
 
@@ -473,7 +470,7 @@ impl TaskInner {
     pub fn time_stat_when_switch_to(&self, current_tick: usize) {
         let time = self.time.get();
         unsafe {
-            (*time).switch_to_new_task(self.id.as_u64() as isize, current_tick);
+            (*time).switch_to_new_task(self.id.as_usize() as isize, current_tick);
         }
     }
 

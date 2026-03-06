@@ -1,0 +1,30 @@
+[package]
+name = "executor"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = ["irq"]
+irq = []
+
+[dependencies]
+axmm.workspace = true
+axsync.workspace = true
+kspin.workspace = true
+scope-local.workspace = true
+percpu = "0.2.0"
+spin.workspace = true
+starry-signal.workspace = true
+asynctask.workspace = true
+axbacktrace.workspace = true
+axconfig.workspace = true
+starry-core.workspace = true
+lazyinit = "0.2"
+axlog.workspace = true
+axhal.workspace = true
+axerrno.workspace = true
+starry-api.workspace = true # 之后考虑把 starry-api 中的内容逐个抽离成单独的模块
+axfs.workspace = true
+
+[target.'cfg(any(target_arch = "riscv32", target_arch = "riscv64"))'.dependencies]
+riscv = "0.11"

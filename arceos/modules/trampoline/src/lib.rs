@@ -9,7 +9,7 @@ extern crate log;
 
 mod arch;
 mod executor_api;
-mod fs_api;
+// mod fs_api;
 mod init_api;
 mod task_api;
 mod trap_api;
@@ -17,8 +17,9 @@ mod trap_api;
 use alloc::sync::Arc;
 pub use arch::init_interrupt;
 use asynctask::{BaseScheduler, CurrentTask, TaskState, TrapStatus};
+use executor::current::CurrentExecutor;
 use core::task::{Context, Poll};
-pub use fs_api::fs_init;
+// pub use fs_api::fs_init;
 pub use init_api::*;
 pub use asynctask::TrapFrame;
 

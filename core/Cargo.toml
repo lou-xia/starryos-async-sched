@@ -49,5 +49,7 @@ uluru = "3.1.0"
 weak-map = "0.1.1"
 xmas-elf = "0.9"
 
+#asynctask.workspace = true
+
 [target.'cfg(not(any(target_arch = "aarch64", target_arch = "loongarch64")))'.dependencies]
 axmm = { workspace = true, features = ["copy"] }

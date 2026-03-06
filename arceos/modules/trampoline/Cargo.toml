@@ -49,7 +49,7 @@ syscalls = { version = "0.6", default-features = false }
 
 asynctask.workspace = true
 axsync = { workspace = true }
-#executor = { path = "../executor" }
+executor = { path = "../../../core/src/executor" }
 axhal = { workspace = true }
 #syscall = { path = "../syscall" }
 #async_mem = { path = "../async_mem" }
