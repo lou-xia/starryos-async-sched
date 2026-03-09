@@ -20,8 +20,6 @@ use futures_util::task::AtomicWaker;
 use kspin::SpinNoIrq;
 use memory_addr::{VirtAddr, align_up_4k};
 
-#[cfg(feature = "task-ext")]
-use crate::task_ext::AxTaskExt;
 use crate::{AxCpuMask, AxTask, AxTaskRef, future::block_on};
 
 /// A unique identifier for a thread.
@@ -43,51 +41,56 @@ pub enum TaskState {
     Exited = 4,
 }
 
+/// User-defined task extended data.
+/// # Safety
+/// See [`extern_trait`].
+#[cfg(feature = "task-ext")]
+#[extern_trait::extern_trait(
+    /// The impl proxy type for [`TaskExt`].
+    pub AxTaskExt
+)]
+pub unsafe trait TaskExt {
+    /// Called when the task is switched in.
+    fn on_enter(&self) {}
+    /// Called when the task is switched out.
+    fn on_leave(&self) {}
+}
+
 /// The inner task structure.
 pub struct TaskInner {
-    alloc_stack: Option<usize>,
-    coroutine_schedule: Option<usize>,
     id: TaskId,
     name: SpinNoIrq<String>,
     is_idle: bool,
     is_init: bool,
 
-    // entry: Cell<Option<Box<dyn FnOnce()>>>,
+    entry: Cell<Option<Box<dyn FnOnce()>>>,
     state: AtomicU8,
 
     /// CPU affinity mask.
-    // 移动到 TaskInnerExt
-    // cpumask: SpinNoIrq<AxCpuMask>,
+    cpumask: SpinNoIrq<AxCpuMask>,
 
     /// Used to indicate the CPU ID where the task is running or will run.
-    // cpu_id: AtomicU32,
+    cpu_id: AtomicU32,
     /// Used to indicate whether the task is running on a CPU.
     #[cfg(feature = "smp")]
     on_cpu: AtomicBool,
-    /// Mark whether the task is in the wait queue.
-    in_wait_queue: AtomicBool,
-
-    // #[cfg(feature = "irq")]
-    timer_ticket_id: AtomicU64,
-
-
 
     #[cfg(feature = "preempt")]
     need_resched: AtomicBool,
     #[cfg(feature = "preempt")]
     preempt_disable_count: AtomicUsize,
 
-    // interrupted: AtomicBool,
-    // interrupt_waker: AtomicWaker,
+    interrupted: AtomicBool,
+    interrupt_waker: AtomicWaker,
 
-    // exit_code: AtomicI32,
-    // wait_for_exit: AtomicWaker,
+    exit_code: AtomicI32,
+    wait_for_exit: AtomicWaker,
 
-    kstack: UnsafeCell<Option<TaskStack>>,
+    kstack: Option<TaskStack>,
     ctx: UnsafeCell<TaskContext>,
 
-    // #[cfg(feature = "task-ext")]
-    // task_ext: Option<AxTaskExt>,
+    #[cfg(feature = "task-ext")]
+    task_ext: Option<AxTaskExt>,
 
     #[cfg(feature = "tls")]
     tls: TlsArea,
@@ -123,9 +126,11 @@ unsafe impl Sync for TaskInner {}
 
 impl TaskInner {
     /// Create a new task with the given entry function and stack size.
-    pub fn new(entry: usize, name: String, stack_size: usize) -> Self
+    pub fn new<F>(entry: F, name: String, stack_size: usize) -> Self
+    where
+        F: FnOnce() + Send + 'static,
     {
-        let mut t = Self::new_common(name);
+        let mut t = Self::new_common(TaskId::new(), name);
         debug!("new task: {}", t.id_name());
         let kstack = TaskStack::alloc(align_up_4k(stack_size));
 
@@ -133,9 +138,11 @@ impl TaskInner {
         let tls = VirtAddr::from(t.tls.tls_ptr() as usize);
         #[cfg(not(feature = "tls"))]
         let tls = VirtAddr::from(0);
+
+        t.entry = Cell::new(Some(Box::new(entry)));
         t.ctx_mut()
-            .init(entry, kstack.top(), tls);
-        t.kstack = UnsafeCell::new(Some(kstack));
+            .init(task_entry as *const () as usize, kstack.top(), tls);
+        t.kstack = Some(kstack);
         if t.name() == "idle" {
             t.is_idle = true;
         }
@@ -162,40 +169,30 @@ impl TaskInner {
         alloc::format!("Task({}, {:?})", self.id.as_u64(), self.name())
     }
 
-    /// Setup the TaskStack alloc fn.
-    pub fn set_alloc_stack_fn(&mut self, alloc_fn: usize) {
-        self.alloc_stack = Some(alloc_fn);
+    /// Wait for the task to exit, and return the exit code.
+    ///
+    /// It will return immediately if the task has already exited (but not dropped).
+    pub fn join(&self) -> i32 {
+        block_on(poll_fn(|cx| {
+            if self.state() == TaskState::Exited {
+                return Poll::Ready(self.exit_code.load(Ordering::Acquire));
+            }
+            self.wait_for_exit.register(cx.waker());
+            Poll::Pending
+        }))
     }
 
-    /// Setup the coroutine entry.
-    pub fn set_coroutine_schedule(&mut self, coroutine_schedule: usize) {
-        self.coroutine_schedule = Some(coroutine_schedule);
+    /// Returns a reference to the task extended data.
+    #[cfg(feature = "task-ext")]
+    pub fn task_ext(&self) -> Option<&AxTaskExt> {
+        self.task_ext.as_ref()
     }
 
-    // /// Wait for the task to exit, and return the exit code.
-    // ///
-    // /// It will return immediately if the task has already exited (but not dropped).
-    // pub fn join(&self) -> i32 {
-    //     block_on(poll_fn(|cx| {
-    //         if self.state() == TaskState::Exited {
-    //             return Poll::Ready(self.exit_code.load(Ordering::Acquire));
-    //         }
-    //         self.wait_for_exit.register(cx.waker());
-    //         Poll::Pending
-    //     }))
-    // }
-
-    // /// Returns a reference to the task extended data.
-    // #[cfg(feature = "task-ext")]
-    // pub fn task_ext(&self) -> Option<&AxTaskExt> {
-    //     self.task_ext.as_ref()
-    // }
-
-    // /// Returns a mutable reference to the task extended data.
-    // #[cfg(feature = "task-ext")]
-    // pub fn task_ext_mut(&mut self) -> &mut Option<AxTaskExt> {
-    //     &mut self.task_ext
-    // }
+    /// Returns a mutable reference to the task extended data.
+    #[cfg(feature = "task-ext")]
+    pub fn task_ext_mut(&mut self) -> &mut Option<AxTaskExt> {
+        &mut self.task_ext
+    }
 
     /// Returns a mutable reference to the task context.
     #[inline]
@@ -206,122 +203,94 @@ impl TaskInner {
     /// Returns the top address of the kernel stack.
     #[inline]
     pub const fn kernel_stack_top(&self) -> Option<VirtAddr> {
-        match unsafe { &*self.kstack.get() } {
+        match &self.kstack {
             Some(s) => Some(s.top()),
             None => None,
         }
     }
 
-    /// Get the mut ref about the `kstack` field.
+    /// Returns the CPU ID where the task is running or will run.
+    ///
+    /// Note: the task may not be running on the CPU, it just exists in the run queue.
     #[inline]
-    pub const unsafe fn kernel_stack(&self) -> *mut Option<TaskStack> {
-        self.kstack.get()
+    pub fn cpu_id(&self) -> u32 {
+        self.cpu_id.load(Ordering::Acquire)
     }
 
-    /// Once the `kstack` field is None, the task is a coroutine.
-    /// The `kstack` and the `ctx` will be set up,
-    /// so the next coroutine will start at `coroutine_schedule` function.
+    /// Gets the cpu affinity mask of the task.
     ///
-    /// This function is only used before switching task.
+    /// Returns the cpu affinity mask of the task in type [`AxCpuMask`].
     #[inline]
-    pub fn set_kstack(&self) {
-        let kstack = unsafe { &mut *self.kernel_stack() };
-        if kstack.is_none() && !self.is_init && !self.is_idle {
-            let alloc_stack_fn: fn() -> TaskStack =
-                unsafe { core::mem::transmute(self.alloc_stack.unwrap()) };
-            let stack = alloc_stack_fn();
-            let kstack_top = stack.top();
-            *kstack = Some(stack);
-            let ctx = unsafe { &mut *self.ctx_mut_ptr() };
-            ctx.init(self.coroutine_schedule.unwrap(), kstack_top);
+    pub fn cpumask(&self) -> AxCpuMask {
+        *self.cpumask.lock()
+    }
+
+    /// Sets the cpu affinity mask of the task.
+    ///
+    /// # Arguments
+    /// `cpumask` - The cpu affinity mask to be set in type [`AxCpuMask`].
+    #[inline]
+    pub fn set_cpumask(&self, cpumask: AxCpuMask) {
+        *self.cpumask.lock() = cpumask
+    }
+
+    /// Polls whether the task has been interrupted.
+    #[inline]
+    pub fn poll_interrupt(&self, cx: &Context) -> Poll<()> {
+        if self.interrupted.swap(false, Ordering::AcqRel) {
+            Poll::Ready(())
+        } else {
+            self.interrupt_waker.register(cx.waker());
+            Poll::Pending
         }
     }
 
-    // /// Returns the CPU ID where the task is running or will run.
-    // ///
-    // /// Note: the task may not be running on the CPU, it just exists in the run queue.
-    // #[inline]
-    // pub fn cpu_id(&self) -> u32 {
-    //     self.cpu_id.load(Ordering::Acquire)
-    // }
+    /// Clears the interrupt state of the task.
+    #[inline]
+    pub fn clear_interrupt(&self) {
+        self.interrupted.store(false, Ordering::Release);
+    }
 
-    // /// Gets the cpu affinity mask of the task.
-    // ///
-    // /// Returns the cpu affinity mask of the task in type [`AxCpuMask`].
-    // #[inline]
-    // pub fn cpumask(&self) -> AxCpuMask {
-    //     *self.cpumask.lock()
-    // }
-
-    // /// Sets the cpu affinity mask of the task.
-    // ///
-    // /// # Arguments
-    // /// `cpumask` - The cpu affinity mask to be set in type [`AxCpuMask`].
-    // #[inline]
-    // pub fn set_cpumask(&self, cpumask: AxCpuMask) {
-    //     *self.cpumask.lock() = cpumask
-    // }
-
-    // /// Polls whether the task has been interrupted.
-    // #[inline]
-    // pub fn poll_interrupt(&self, cx: &Context) -> Poll<()> {
-    //     if self.interrupted.swap(false, Ordering::AcqRel) {
-    //         Poll::Ready(())
-    //     } else {
-    //         self.interrupt_waker.register(cx.waker());
-    //         Poll::Pending
-    //     }
-    // }
-
-    // /// Clears the interrupt state of the task.
-    // #[inline]
-    // pub fn clear_interrupt(&self) {
-    //     self.interrupted.store(false, Ordering::Release);
-    // }
-
-    // /// Interrupts the task.
-    // #[inline]
-    // pub fn interrupt(&self) {
-    //     self.interrupted.store(true, Ordering::Release);
-    //     self.interrupt_waker.wake();
-    // }
+    /// Interrupts the task.
+    #[inline]
+    pub fn interrupt(&self) {
+        self.interrupted.store(true, Ordering::Release);
+        self.interrupt_waker.wake();
+    }
 }
 
 // private methods
 impl TaskInner {
-    fn new_common(name: String) -> Self {
-        // let mut cpumask = AxCpuMask::new();
-        // for cpu_id in 0..crate::api::active_cpu_num() {
-        //     cpumask.set(cpu_id, true);
-        // }
+    fn new_common(id: TaskId, name: String) -> Self {
+        let mut cpumask = AxCpuMask::new();
+        for cpu_id in 0..crate::api::active_cpu_num() {
+            cpumask.set(cpu_id, true);
+        }
 
         Self {
-            alloc_stack: None,
-            coroutine_schedule: None,
-            id: TaskId::new(),
+            id,
             name: SpinNoIrq::new(name),
             is_idle: false,
             is_init: false,
+            entry: Cell::new(None),
             state: AtomicU8::new(TaskState::Ready as u8),
-            timer_ticket_id: AtomicU64::new(0),
             // By default, the task is allowed to run on all CPUs.
-            // cpumask: SpinNoIrq::new(cpumask),
-            // cpu_id: AtomicU32::new(0),
-            // #[cfg(feature = "smp")]
+            cpumask: SpinNoIrq::new(cpumask),
+            cpu_id: AtomicU32::new(0),
+            #[cfg(feature = "smp")]
             on_cpu: AtomicBool::new(false),
-            in_wait_queue: AtomicBool::new(false),
             #[cfg(feature = "preempt")]
             need_resched: AtomicBool::new(false),
             #[cfg(feature = "preempt")]
             preempt_disable_count: AtomicUsize::new(0),
-            // interrupted: AtomicBool::new(false),
-            // interrupt_waker: AtomicWaker::new(),
-            // exit_code: AtomicI32::new(0),
-            // wait_for_exit: AtomicWaker::new(),
-            kstack: UnsafeCell::new(None),
+            interrupted: AtomicBool::new(false),
+            interrupt_waker: AtomicWaker::new(),
+            exit_code: AtomicI32::new(0),
+            wait_for_exit: AtomicWaker::new(),
+            kstack: None,
             ctx: UnsafeCell::new(TaskContext::new()),
             #[cfg(feature = "task-ext")]
-            // task_ext: None,
+            task_ext: None,
             #[cfg(feature = "tls")]
             tls: TlsArea::alloc(),
         }
@@ -336,7 +305,7 @@ impl TaskInner {
     /// And there is no need to set the `entry`, `kstack` or `tls` fields, as
     /// they will be filled automatically when the task is switches out.
     pub(crate) fn new_init(name: String) -> Self {
-        let mut t = Self::new_common(name);
+        let mut t = Self::new_common(TaskId::new(), name);
         t.is_init = true;
         #[cfg(feature = "smp")]
         t.set_on_cpu(true);
@@ -346,9 +315,9 @@ impl TaskInner {
         t
     }
 
-    // pub(crate) fn into_arc(self) -> AxTaskRef {
-    //     Arc::new(AxTask::new(self))
-    // }
+    pub(crate) fn into_arc(self) -> AxTaskRef {
+        Arc::new(AxTask::new(self))
+    }
 
     /// Returns the current state of the task.
     #[inline]
@@ -397,53 +366,9 @@ impl TaskInner {
     }
 
     #[inline]
-    pub fn in_wait_queue(&self) -> bool {
-        self.in_wait_queue.load(Ordering::Acquire)
-    }
-
-    #[inline]
-    pub fn set_in_wait_queue(&self, in_wait_queue: bool) {
-        self.in_wait_queue.store(in_wait_queue, Ordering::Release);
-    }
-
-    /// Returns task's current timer ticket ID.
-    #[inline]
-    // #[cfg(feature = "irq")]
-    pub fn timer_ticket(&self) -> u64 {
-        self.timer_ticket_id.load(Ordering::Acquire)
-    }
-
-    /// Set the timer ticket ID.
-    #[inline]
-    // #[cfg(feature = "irq")]
-    pub fn set_timer_ticket(&self, timer_ticket_id: u64) {
-        // CAN NOT set timer_ticket_id to 0,
-        // because 0 is used to indicate the timer event is expired.
-        assert!(timer_ticket_id != 0);
-        self.timer_ticket_id
-            .store(timer_ticket_id, Ordering::Release);
-    }
-
-    /// Expire timer ticket ID by setting it to 0,
-    /// it can be used to identify one timer event is triggered or expired.
-    // #[cfg(feature = "alloc")]
-    #[inline]
-    // #[cfg(feature = "irq")]
-    pub fn timer_ticket_expired(&self) {
-        self.timer_ticket_id.store(0, Ordering::Release);
-    }
-
-
-    #[inline]
     #[cfg(feature = "preempt")]
     pub(crate) fn set_preempt_pending(&self, pending: bool) {
         self.need_resched.store(pending, Ordering::Release)
-    }
-
-    #[inline]
-    #[cfg(feature = "preempt")]
-    pub fn need_resched(&self) -> bool {
-        self.need_resched.load(Ordering::Acquire)
     }
 
     #[inline]
@@ -481,24 +406,24 @@ impl TaskInner {
         }
     }
 
-    // /// Notify all tasks that join on this task.
-    // pub(crate) fn notify_exit(&self, exit_code: i32) {
-    //     self.set_state(TaskState::Exited);
-    //     self.exit_code.store(exit_code, Ordering::Release);
-    //     self.wait_for_exit.wake();
-    // }
+    /// Notify all tasks that join on this task.
+    pub(crate) fn notify_exit(&self, exit_code: i32) {
+        self.set_state(TaskState::Exited);
+        self.exit_code.store(exit_code, Ordering::Release);
+        self.wait_for_exit.wake();
+    }
 
     #[inline]
     pub(crate) const unsafe fn ctx_mut_ptr(&self) -> *mut TaskContext {
         self.ctx.get()
     }
 
-    // /// Set the CPU ID where the task is running or will run.
-    // #[cfg(feature = "smp")]
-    // #[inline]
-    // pub(crate) fn set_cpu_id(&self, cpu_id: u32) {
-    //     self.cpu_id.store(cpu_id, Ordering::Release);
-    // }
+    /// Set the CPU ID where the task is running or will run.
+    #[cfg(feature = "smp")]
+    #[inline]
+    pub(crate) fn set_cpu_id(&self, cpu_id: u32) {
+        self.cpu_id.store(cpu_id, Ordering::Release);
+    }
 
     /// Returns whether the task is running on a CPU.
     ///
@@ -530,11 +455,11 @@ impl fmt::Debug for TaskInner {
     }
 }
 
-// impl Drop for TaskInner {
-//     fn drop(&mut self) {
-//         debug!("task drop: {}", self.id_name());
-//     }
-// }
+impl Drop for TaskInner {
+    fn drop(&mut self) {
+        debug!("task drop: {}", self.id_name());
+    }
+}
 
 struct TaskStack {
     ptr: NonNull<u8>,
