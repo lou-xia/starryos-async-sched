@@ -43,7 +43,6 @@ cfg_if::cfg_if! {
         mod task;
         mod api;
         mod wait_queue;
-        mod task_ext;
 
         #[cfg(feature = "irq")]
         mod timers;

@@ -1,10 +1,11 @@
-use core::{ffi::c_long, sync::atomic::Ordering};
+use core::{ffi::c_long, sync::atomic::{AtomicBool, Ordering}};
 
 use axerrno::{AxError, AxResult};
 use axhal::uspace::{ExceptionKind, ReturnReason, UserContext};
-use axtask::{TaskInner, current};
+use axtask::{TaskInner, current, spawn_task};
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::general::ROBUST_LIST_LIMIT;
+use ringbuf::Arc;
 use starry_core::{
     futex::FutexKey,
     shm::SHM_MANAGER,
@@ -42,7 +43,14 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
                 set_timer_state(&curr, TimerState::Kernel);
 
                 match reason {
-                    ReturnReason::Syscall => handle_syscall(&mut uctx),
+                    // ReturnReason::Syscall => handle_syscall(&mut uctx),
+                    ReturnReason::Syscall => {
+                        let finish = Arc::new(AtomicBool::new(false));
+                        syscall_task(uctx, finish.clone());
+                        while !finish.load(Ordering::SeqCst) {
+                            axtask::yield_now();
+                        }
+                    }
                     ReturnReason::PageFault(addr, flags) => {
                         if !thr.proc_data.aspace.lock().handle_page_fault(addr, flags) {
                             info!(
@@ -217,4 +225,14 @@ pub fn raise_signal_fatal(sig: SignalInfo) -> AxResult<()> {
     }
 
     Ok(())
+}
+
+fn syscall_task(mut uctx: UserContext, finish: Arc<AtomicBool>) {
+    let entry = move || {
+        assert!(!finish.load(Ordering::SeqCst), "Syscall task should only run once");
+        handle_syscall(&mut uctx);
+        finish.store(true, Ordering::SeqCst);
+    };
+    let task = TaskInner::new(entry, "syscall".into(), starry_core::config::KERNEL_STACK_SIZE);
+    spawn_task(task);
 }
