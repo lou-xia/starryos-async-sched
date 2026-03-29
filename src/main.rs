@@ -20,6 +20,8 @@ pub const CMDLINE: &[&str] = &["/bin/sh", "-c", include_str!("init.sh")];
 fn main() {
     starry_api::init();
 
+    vdso::vdso_init();
+
     let args = CMDLINE
         .iter()
         .copied()

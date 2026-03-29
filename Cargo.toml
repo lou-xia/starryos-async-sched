@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["api", "core"]
-exclude = ["arceos"]
+exclude = ["arceos", "vdso_output/vdso_wrapper", "vdso_output/libvdsoexample"]
 
 [workspace.package]
 version = "0.1.0"
@@ -50,6 +50,9 @@ axtask = { path = "arceos/modules/axtask" }
 #asynctask = { path = "arceos/modules/asynctask" }
 #trampoline = { path = "arceos/modules/trampoline" }
 #executor = { path = "core/src/executor" }
+
+vdso_example = { path = "vdso_example" }
+vdso = { path = "vdso" }
 
 axbacktrace = "0.1"
 axerrno = "0.2"
@@ -135,6 +138,9 @@ starry-api.workspace = true
 #asynctask.workspace = true
 #trampoline.workspace = true
 #executor.workspace = true
+
+vdso_example.workspace = true
+vdso.workspace = true
 
 [dependencies.axplat-riscv64-visionfive2]
 version = "0.1.0-pre.1"

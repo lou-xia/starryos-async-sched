@@ -182,7 +182,7 @@ dependencies = [
  "cfg-if",
  "kspin",
  "log",
- "memory_addr",
+ "memory_addr 0.4.1",
  "percpu",
  "strum",
 ]
@@ -243,7 +243,7 @@ dependencies = [
  "linkme",
  "log",
  "loongArch64",
- "memory_addr",
+ "memory_addr 0.4.1",
  "page_table_entry",
  "page_table_multiarch 0.5.8",
  "percpu",
@@ -280,7 +280,7 @@ dependencies = [
  "axdriver_vsock",
  "axhal",
  "cfg-if",
- "crate_interface",
+ "crate_interface 0.1.4",
  "log",
  "smallvec",
 ]
@@ -367,6 +367,15 @@ checksum = "4a88b1fa2ce97a6ff4ce31ba9fda3065730ca4d77a1ba50dec000fc04f1fb686"
 dependencies = [
  "axerrno 0.2.2",
  "log",
+]
+
+[[package]]
+name = "axerrno"
+version = "0.2.0"
+source = "git+https://github.com/Starry-OS/axerrno.git#97b44e3f7380a95097353baa00016a0b98059246"
+dependencies = [
+ "log",
+ "strum",
 ]
 
 [[package]]
@@ -459,7 +468,7 @@ dependencies = [
  "lazyinit",
  "linkme",
  "log",
- "memory_addr",
+ "memory_addr 0.4.1",
  "page_table_multiarch 0.5.7",
  "percpu",
 ]
@@ -491,7 +500,7 @@ name = "axlog"
 version = "0.2.0"
 dependencies = [
  "cfg-if",
- "crate_interface",
+ "crate_interface 0.1.4",
  "kspin",
  "log",
 ]
@@ -512,7 +521,7 @@ dependencies = [
  "kspin",
  "lazyinit",
  "log",
- "memory_addr",
+ "memory_addr 0.4.1",
  "memory_set",
  "page_table_multiarch 0.5.7",
 ]
@@ -555,10 +564,10 @@ dependencies = [
  "axplat-macros",
  "bitflags 2.10.0",
  "const-str",
- "crate_interface",
+ "crate_interface 0.1.4",
  "handler_table",
  "kspin",
- "memory_addr",
+ "memory_addr 0.4.1",
  "percpu",
 ]
 
@@ -717,7 +726,7 @@ dependencies = [
  "axplat",
  "axtask",
  "chrono",
- "crate_interface",
+ "crate_interface 0.1.4",
  "ctor_bare",
  "indoc",
  "percpu",
@@ -753,7 +762,7 @@ dependencies = [
  "axsched",
  "cfg-if",
  "cpumask",
- "crate_interface",
+ "crate_interface 0.1.4",
  "event-listener",
  "extern-trait",
  "futures-util",
@@ -761,7 +770,7 @@ dependencies = [
  "kspin",
  "lazyinit",
  "log",
- "memory_addr",
+ "memory_addr 0.4.1",
  "percpu",
 ]
 
@@ -846,6 +855,14 @@ name = "buddy_system_allocator"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a7913f22349ffcfc6ca0ca9a656ec26cfbba538ed49c31a273dff2c5d1ea83d9"
+
+[[package]]
+name = "build_vdso"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "xmas-elf",
+]
 
 [[package]]
 name = "bytemuck"
@@ -1020,6 +1037,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "crate_interface"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15627e437dc14b22c0a7b8cfc7143fbab68aa6d740df2d695152b1dca58cdf17"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.114",
+]
+
+[[package]]
 name = "critical-section"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1161,6 +1189,19 @@ name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
+
+[[package]]
+name = "elf_parser"
+version = "0.1.0"
+source = "git+https://github.com/rosy233333/elf_parser.git#585c69df01c752aaeed5bffa6893f9761091550b"
+dependencies = [
+ "axerrno 0.2.0",
+ "cfg-if",
+ "log",
+ "memory_addr 0.1.0",
+ "page_table_entry",
+ "xmas-elf",
+]
 
 [[package]]
 name = "embedded-hal"
@@ -1394,6 +1435,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
+name = "include_bytes_aligned"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ee796ad498c8d9a1d68e477df8f754ed784ef875de1414ebdaf169f70a6a784"
+
+[[package]]
 name = "indexmap"
 version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1472,7 +1519,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d10c55bedf6789bc3748e0d8756ee639df1ae25144fd3525ed311044bd9a739f"
 dependencies = [
  "cfg-if",
- "crate_interface",
+ "crate_interface 0.1.4",
 ]
 
 [[package]]
@@ -1514,6 +1561,18 @@ checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
 dependencies = [
  "cfg-if",
  "windows-link",
+]
+
+[[package]]
+name = "libvdsoexample"
+version = "0.0.0"
+dependencies = [
+ "crate_interface 0.2.0",
+ "elf_parser",
+ "include_bytes_aligned",
+ "page_table_entry",
+ "vdso_example",
+ "xmas-elf",
 ]
 
 [[package]]
@@ -1614,6 +1673,11 @@ dependencies = [
 
 [[package]]
 name = "memory_addr"
+version = "0.1.0"
+source = "git+https://github.com/Starry-OS/memory_addr.git#a5be547a3109f114994d005b893f9b19c2616709"
+
+[[package]]
+name = "memory_addr"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1f0625c50adb5f6aaf47f05cae3c4dbc13a74c659241b06c4576f3d7e1da940"
@@ -1625,7 +1689,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "50a49ecd4114cf87f7e442ec5dd03bd590e7094541f987057310dbb32a6341ad"
 dependencies = [
  "axerrno 0.1.2",
- "memory_addr",
+ "memory_addr 0.4.1",
 ]
 
 [[package]]
@@ -1727,7 +1791,7 @@ checksum = "3af51afffbce2ea801b0830b29fcea77068e821521f13c5e3e4734585abcc061"
 dependencies = [
  "aarch64-cpu",
  "bitflags 2.10.0",
- "memory_addr",
+ "memory_addr 0.4.1",
  "x86_64",
 ]
 
@@ -1740,7 +1804,7 @@ dependencies = [
  "axerrno 0.1.2",
  "bitmaps",
  "log",
- "memory_addr",
+ "memory_addr 0.4.1",
  "page_table_entry",
  "riscv",
  "x86",
@@ -1754,7 +1818,7 @@ checksum = "a012c0bb9b8b0c4887d0b90f37cf8164537b69bb5560ecdcf4ada0c3b64e3976"
 dependencies = [
  "arrayvec",
  "log",
- "memory_addr",
+ "memory_addr 0.4.1",
  "page_table_entry",
  "riscv",
  "x86",
@@ -2170,6 +2234,8 @@ dependencies = [
  "starry-core",
  "starry-process",
  "starry-signal",
+ "vdso",
+ "vdso_example",
 ]
 
 [[package]]
@@ -2210,7 +2276,7 @@ dependencies = [
  "lazy_static",
  "linkme",
  "linux-raw-sys",
- "memory_addr",
+ "memory_addr 0.4.1",
  "num_enum",
  "rand",
  "ringbuf",
@@ -2258,7 +2324,7 @@ dependencies = [
  "linkme",
  "linux-raw-sys",
  "lock_api",
- "memory_addr",
+ "memory_addr 0.4.1",
  "ouroboros",
  "percpu",
  "scope-local",
@@ -2506,6 +2572,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
+name = "vdso"
+version = "0.1.0"
+dependencies = [
+ "axalloc",
+ "axhal",
+ "axlog",
+ "axmm",
+ "build_vdso",
+ "crate_interface 0.2.0",
+ "libvdsoexample",
+ "memory_addr 0.4.1",
+]
+
+[[package]]
+name = "vdso_example"
+version = "0.1.0"
+dependencies = [
+ "lazyinit",
+ "vdso_helper",
+]
+
+[[package]]
+name = "vdso_helper"
+version = "0.1.0"
+dependencies = [
+ "lazyinit",
+ "paste",
+ "vsched_hal",
+]
+
+[[package]]
 name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2547,6 +2644,23 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.114",
+]
+
+[[package]]
+name = "vsched_hal"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2b4383b05f5161712f03988daf29592ff11499cf63bbe5b27ceea58030e9be6"
+dependencies = [
+ "aarch64-cpu",
+ "cfg-if",
+ "linkme",
+ "memory_addr 0.4.1",
+ "page_table_entry",
+ "riscv",
+ "static_assertions",
+ "x86",
+ "x86_64",
 ]
 
 [[package]]

@@ -43,14 +43,14 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
                 set_timer_state(&curr, TimerState::Kernel);
 
                 match reason {
-                    // ReturnReason::Syscall => handle_syscall(&mut uctx),
-                    ReturnReason::Syscall => {
-                        let finish = Arc::new(AtomicBool::new(false));
-                        syscall_task(uctx, finish.clone());
-                        while !finish.load(Ordering::SeqCst) {
-                            axtask::yield_now();
-                        }
-                    }
+                    ReturnReason::Syscall => handle_syscall(&mut uctx),
+                    // ReturnReason::Syscall => {
+                    //     let finish = Arc::new(AtomicBool::new(false));
+                    //     syscall_task(uctx, finish.clone());
+                    //     while !finish.load(Ordering::SeqCst) {
+                    //         axtask::yield_now();
+                    //     }
+                    // }
                     ReturnReason::PageFault(addr, flags) => {
                         if !thr.proc_data.aspace.lock().handle_page_fault(addr, flags) {
                             info!(

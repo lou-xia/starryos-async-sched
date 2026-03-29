@@ -1,0 +1,8 @@
+[package]
+name = "vdso_example"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+vdso_helper = { path = "../../vdso_crate_template/vdso_crate_template/vdso_helper" }
+lazyinit = "0.2"
