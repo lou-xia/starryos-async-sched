@@ -335,6 +335,26 @@ pub fn load_user_app(
     )?;
     uspace.write(user_sp, stack_data.as_slice())?;
 
+    let vdso_size = unsafe { vdso::VDSO_SIZE };
+    let vdso_start = ustack_start - vdso_size;
+    uspace.map_linear(
+        vdso_start,
+        unsafe { vdso::VDSO_START.into() },
+        vdso_size,
+        MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE | MappingFlags::USER,
+    )?;
+
+    let vvar_size = unsafe { vdso::VVAR_SIZE };
+    let vvar_start = vdso_start - vvar_size;
+    uspace.map_linear(
+        vvar_start,
+        unsafe { vdso::VVAR_START.into() },
+        vvar_size,
+        MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER,
+    )?;
+
+    unsafe { vdso::init_vdso_vtable(vdso_start.as_usize() as u64) };
+
     let heap_start = VirtAddr::from_usize(crate::config::USER_HEAP_BASE);
     let heap_size = crate::config::USER_HEAP_SIZE;
     uspace.map(

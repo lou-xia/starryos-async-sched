@@ -2335,6 +2335,7 @@ dependencies = [
  "starry-vm",
  "strum",
  "uluru",
+ "vdso",
  "weak-map",
  "xmas-elf",
 ]
