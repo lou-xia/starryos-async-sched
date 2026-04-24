@@ -11,6 +11,8 @@ axhal.workspace = true
 axalloc.workspace = true
 memory_addr.workspace = true
 axlog.workspace = true
+axerrno.workspace = true
+axsync.workspace = true
 
 [build-dependencies]
 #build_vdso = "0.1.0"

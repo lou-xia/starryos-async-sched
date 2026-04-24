@@ -34,6 +34,17 @@ rootfs:
 	fi
 	@cp $(ROOTFS_IMG) arceos/disk.img
 
+copy_tests:
+	@if [ -d tests ]; then \
+		echo "Copying tests folder to disk.img..."; \
+		mkdir -p /tmp/disk_mount; \
+		sudo mount -t ext4 -o loop arceos/disk.img /tmp/disk_mount; \
+		sudo cp -r tests /tmp/disk_mount/; \
+		sudo umount /tmp/disk_mount; \
+		rm -rf /tmp/disk_mount; \
+		echo "Tests folder copied successfully."; \
+	fi
+
 img:
 	@echo -e "\033[33mWARN: The 'img' target is deprecated. Please use 'rootfs' instead.\033[0m"
 	@$(MAKE) --no-print-directory rootfs
@@ -43,6 +54,12 @@ defconfig justrun clean:
 
 build run debug disasm: defconfig
 	@make -C arceos $@
+
+uapp:
+	cd tests && $(MAKE) build_uapps
+
+test: uapp copy_tests
+	@make -C arceos run
 
 # Aliases
 rv:

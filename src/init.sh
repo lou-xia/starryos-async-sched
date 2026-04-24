@@ -11,5 +11,8 @@ echo
 
 # Do your initialization here!
 
-cd ~
-sh --login
+# cd ~
+# sh --login
+cd /tests/target/riscv64gc-unknown-linux-musl/release/
+./vdso_test
+exit

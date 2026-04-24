@@ -2577,9 +2577,11 @@ name = "vdso"
 version = "0.1.0"
 dependencies = [
  "axalloc",
+ "axerrno 0.2.2",
  "axhal",
  "axlog",
  "axmm",
+ "axsync",
  "build_vdso",
  "crate_interface 0.2.0",
  "libvdsoexample",
@@ -2650,8 +2652,7 @@ dependencies = [
 [[package]]
 name = "vsched_hal"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2b4383b05f5161712f03988daf29592ff11499cf63bbe5b27ceea58030e9be6"
+source = "git+https://github.com/rosy233333/vsched_hal.git#dee679657967967bc21fddda48df643aac1baae1"
 dependencies = [
  "aarch64-cpu",
  "cfg-if",

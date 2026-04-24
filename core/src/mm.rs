@@ -15,7 +15,7 @@ use axmm::{AddrSpace, backend::Backend};
 use axsync::Mutex;
 use axtask::current;
 use extern_trait::extern_trait;
-use kernel_elf_parser::{AuxEntry, ELFHeaders, ELFHeadersBuilder, ELFParser, app_stack_region};
+use kernel_elf_parser::{AuxEntry, AuxType, ELFHeaders, ELFHeadersBuilder, ELFParser, app_stack_region};
 use kernel_guard::IrqSave;
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
 use ouroboros::self_referencing;
@@ -291,7 +291,7 @@ pub fn load_user_app(
         return load_user_app(uspace, None, &new_args, envs);
     }
 
-    let (entry, auxv) = match { ELF_LOADER.lock().load(uspace, path)? } {
+    let (entry, mut auxv) = match { ELF_LOADER.lock().load(uspace, path)? } {
         Ok((entry, auxv)) => (entry, auxv),
         Err(data) => {
             if data.starts_with(b"#!") {
@@ -325,6 +325,17 @@ pub fn load_user_app(
         Backend::new_alloc(ustack_start, PageSize::Size4K),
     )?;
 
+    let vdso_size = unsafe { vdso::VDSO_SIZE };
+    let vdso_start = ustack_start - vdso_size;
+    let vvar_size = unsafe { vdso::VVAR_SIZE };
+    let vvar_start = vdso_start - vvar_size;
+
+    auxv.push(AuxEntry::new(AuxType::SYSINFO_EHDR, vdso_start.into()));
+    
+    // auxv.iter().for_each(|entry| {
+    //     ax_println!("auxv: {:?}, {:#x?}", entry.get_type() as usize, entry.value())
+    // });
+
     let stack_data = app_stack_region(args, envs, &auxv, ustack_top.into());
     let user_sp = ustack_top - stack_data.len();
     let user_sp_aligned = user_sp.align_down_4k();
@@ -335,17 +346,12 @@ pub fn load_user_app(
     )?;
     uspace.write(user_sp, stack_data.as_slice())?;
 
-    let vdso_size = unsafe { vdso::VDSO_SIZE };
-    let vdso_start = ustack_start - vdso_size;
     uspace.map_linear(
         vdso_start,
         unsafe { vdso::VDSO_START.into() },
         vdso_size,
         MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE | MappingFlags::USER,
     )?;
-
-    let vvar_size = unsafe { vdso::VVAR_SIZE };
-    let vvar_start = vdso_start - vvar_size;
     uspace.map_linear(
         vvar_start,
         unsafe { vdso::VVAR_START.into() },
@@ -353,7 +359,7 @@ pub fn load_user_app(
         MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER,
     )?;
 
-    unsafe { vdso::init_vdso_vtable(vdso_start.as_usize() as u64) };
+    // unsafe { vdso::init_vdso_vtable(vdso_start.as_usize() as u64) };
 
     let heap_start = VirtAddr::from_usize(crate::config::USER_HEAP_BASE);
     let heap_size = crate::config::USER_HEAP_SIZE;
