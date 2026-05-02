@@ -859,6 +859,7 @@ checksum = "a7913f22349ffcfc6ca0ca9a656ec26cfbba538ed49c31a273dff2c5d1ea83d9"
 [[package]]
 name = "build_vdso"
 version = "0.1.0"
+source = "git+https://github.com/rosy233333/vdso_crate_template#171edfd2e350caff93a9136f1494662c010c5354"
 dependencies = [
  "regex",
  "xmas-elf",
@@ -1570,6 +1571,8 @@ dependencies = [
  "crate_interface 0.2.0",
  "elf_parser",
  "include_bytes_aligned",
+ "lazyinit",
+ "log",
  "page_table_entry",
  "vdso_example",
  "xmas-elf",
@@ -2586,6 +2589,7 @@ dependencies = [
  "crate_interface 0.2.0",
  "libvdsoexample",
  "memory_addr 0.4.1",
+ "vdso_example",
 ]
 
 [[package]]
@@ -2599,6 +2603,7 @@ dependencies = [
 [[package]]
 name = "vdso_helper"
 version = "0.1.0"
+source = "git+https://github.com/rosy233333/vdso_crate_template#171edfd2e350caff93a9136f1494662c010c5354"
 dependencies = [
  "lazyinit",
  "paste",

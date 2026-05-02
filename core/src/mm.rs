@@ -15,12 +15,15 @@ use axmm::{AddrSpace, backend::Backend};
 use axsync::Mutex;
 use axtask::current;
 use extern_trait::extern_trait;
-use kernel_elf_parser::{AuxEntry, AuxType, ELFHeaders, ELFHeadersBuilder, ELFParser, app_stack_region};
+use kernel_elf_parser::{
+    AuxEntry, AuxType, ELFHeaders, ELFHeadersBuilder, ELFParser, app_stack_region,
+};
 use kernel_guard::IrqSave;
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
 use ouroboros::self_referencing;
 use starry_vm::{VmError, VmIo, VmResult};
 use uluru::LRUCache;
+use vdso::map_so;
 
 use crate::{
     config::{USER_SPACE_BASE, USER_SPACE_SIZE},
@@ -325,16 +328,22 @@ pub fn load_user_app(
         Backend::new_alloc(ustack_start, PageSize::Size4K),
     )?;
 
-    let vdso_size = unsafe { vdso::VDSO_SIZE };
-    let vdso_start = ustack_start - vdso_size;
-    let vvar_size = unsafe { vdso::VVAR_SIZE };
-    let vvar_start = vdso_start - vvar_size;
+    let heap_start = VirtAddr::from_usize(crate::config::USER_HEAP_BASE);
+    let heap_size = crate::config::USER_HEAP_SIZE;
+    uspace.map(
+        heap_start,
+        heap_size,
+        MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER,
+        true,
+        Backend::new_alloc(heap_start, PageSize::Size4K),
+    )?;
+
+    // vDSO 由新 loader 直接装入用户地址空间，并返回实际的 ELF 基址。
+    let uspace_ptr = uspace as *mut _ as usize;
+    let vdso_start = VirtAddr::from(map_so(uspace_ptr) as usize);
+    warn!("vdso mapped at: {:#x}", vdso_start.as_usize());
 
     auxv.push(AuxEntry::new(AuxType::SYSINFO_EHDR, vdso_start.into()));
-    
-    // auxv.iter().for_each(|entry| {
-    //     ax_println!("auxv: {:?}, {:#x?}", entry.get_type() as usize, entry.value())
-    // });
 
     let stack_data = app_stack_region(args, envs, &auxv, ustack_top.into());
     let user_sp = ustack_top - stack_data.len();
@@ -345,31 +354,6 @@ pub fn load_user_app(
         MappingFlags::READ | MappingFlags::WRITE,
     )?;
     uspace.write(user_sp, stack_data.as_slice())?;
-
-    uspace.map_linear(
-        vdso_start,
-        unsafe { vdso::VDSO_START.into() },
-        vdso_size,
-        MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE | MappingFlags::USER,
-    )?;
-    uspace.map_linear(
-        vvar_start,
-        unsafe { vdso::VVAR_START.into() },
-        vvar_size,
-        MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER,
-    )?;
-
-    // unsafe { vdso::init_vdso_vtable(vdso_start.as_usize() as u64) };
-
-    let heap_start = VirtAddr::from_usize(crate::config::USER_HEAP_BASE);
-    let heap_size = crate::config::USER_HEAP_SIZE;
-    uspace.map(
-        heap_start,
-        heap_size,
-        MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER,
-        true,
-        Backend::new_alloc(heap_start, PageSize::Size4K),
-    )?;
 
     Ok((entry, user_sp))
 }

@@ -55,7 +55,6 @@ pub unsafe fn set_current_task_ptr<T>(ptr: *const T) {
     }
 }
 
-
 // #[percpu::def_percpu]
 // static CURRENT_EXECUTOR_PTR: usize = 0;
 // #[inline]

@@ -45,10 +45,7 @@ mod time {
     };
 }
 
-pub use self::mem::*;
-pub use self::stdio::*;
-pub use self::task::*;
-pub use self::time::*;
-
 pub use axhal::power::system_off as ax_terminate;
 pub use axio::PollState as AxPollState;
+
+pub use self::{mem::*, stdio::*, task::*, time::*};

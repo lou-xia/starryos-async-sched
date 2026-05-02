@@ -1,4 +1,7 @@
-use core::{ffi::c_long, sync::atomic::{AtomicBool, Ordering}};
+use core::{
+    ffi::c_long,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use axerrno::{AxError, AxResult};
 use axhal::uspace::{ExceptionKind, ReturnReason, UserContext};
@@ -229,10 +232,17 @@ pub fn raise_signal_fatal(sig: SignalInfo) -> AxResult<()> {
 
 fn syscall_task(mut uctx: UserContext, finish: Arc<AtomicBool>) {
     let entry = move || {
-        assert!(!finish.load(Ordering::SeqCst), "Syscall task should only run once");
+        assert!(
+            !finish.load(Ordering::SeqCst),
+            "Syscall task should only run once"
+        );
         handle_syscall(&mut uctx);
         finish.store(true, Ordering::SeqCst);
     };
-    let task = TaskInner::new(entry, "syscall".into(), starry_core::config::KERNEL_STACK_SIZE);
+    let task = TaskInner::new(
+        entry,
+        "syscall".into(),
+        starry_core::config::KERNEL_STACK_SIZE,
+    );
     spawn_task(task);
 }

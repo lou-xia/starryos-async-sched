@@ -42,7 +42,6 @@ pub(crate) unsafe fn mp_boot_stack(sp: usize) -> *mut u8 {
     return 0 as *mut u8;
 }
 
-
 /// The main entry point of the ArceOS runtime for secondary cores.
 ///
 /// It is called from the bootstrapping code in the specific platform crate.

@@ -111,6 +111,7 @@ dependencies = [
  "crate_interface",
  "elf_parser",
  "include_bytes_aligned",
+ "lazyinit",
  "page_table_entry",
  "vdso_example",
  "xmas-elf",
@@ -295,6 +296,7 @@ dependencies = [
 [[package]]
 name = "vdso_helper"
 version = "0.1.0"
+source = "git+https://github.com/rosy233333/vdso_crate_template#171edfd2e350caff93a9136f1494662c010c5354"
 dependencies = [
  "lazyinit",
  "paste",

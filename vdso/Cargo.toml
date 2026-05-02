@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-libvdsoexample = { path = "../vdso_output/libvdsoexample" }
+libvdsoexample = { path = "../vdso_output/libvdsoexample", features = ["log"]}
 crate_interface = "0.2.0"
 axmm.workspace = true
 axhal.workspace = true
@@ -13,7 +13,8 @@ memory_addr.workspace = true
 axlog.workspace = true
 axerrno.workspace = true
 axsync.workspace = true
+vdso_example.workspace = true
 
 [build-dependencies]
-#build_vdso = "0.1.0"
-build_vdso = { path = "../../vdso_crate_template/vdso_crate_template/build_vdso" }
+# build_vdso = { path = "../../vdso_crate_template/vdso_crate_template/build_vdso" }
+build_vdso = { git = "https://github.com/rosy233333/vdso_crate_template", package = "build_vdso" }

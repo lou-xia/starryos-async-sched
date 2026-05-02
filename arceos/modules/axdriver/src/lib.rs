@@ -89,14 +89,13 @@ pub mod prelude;
 
 #[allow(unused_imports)]
 use self::prelude::*;
-pub use self::structs::{AxDeviceContainer, AxDeviceEnum};
-
 #[cfg(feature = "block")]
 pub use self::structs::AxBlockDevice;
 #[cfg(feature = "display")]
 pub use self::structs::AxDisplayDevice;
 #[cfg(feature = "net")]
 pub use self::structs::AxNetDevice;
+pub use self::structs::{AxDeviceContainer, AxDeviceEnum};
 
 /// A structure that contains all device drivers, organized by their category.
 #[derive(Default)]

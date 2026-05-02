@@ -1,6 +1,7 @@
 extern crate alloc;
 
 use alloc::format;
+
 use arm_gic_driver::v2::{Gic, HyperAddress};
 use rdrive::{PlatformDevice, module_driver, probe::OnProbeError, register::FdtInfo};
 

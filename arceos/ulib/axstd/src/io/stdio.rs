@@ -1,8 +1,10 @@
-use crate::io::{self, BufReader, prelude::*};
-use crate::sync::{Mutex, MutexGuard};
-
 #[cfg(feature = "alloc")]
 use alloc::{string::String, vec::Vec};
+
+use crate::{
+    io::{self, BufReader, prelude::*},
+    sync::{Mutex, MutexGuard},
+};
 
 struct StdinRaw;
 struct StdoutRaw;
@@ -26,6 +28,7 @@ impl Write for StdoutRaw {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         arceos_api::stdio::ax_console_write_bytes(buf)
     }
+
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
@@ -134,6 +137,7 @@ impl Write for Stdout {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.inner.lock().write(buf)
     }
+
     fn flush(&mut self) -> io::Result<()> {
         self.inner.lock().flush()
     }
@@ -143,6 +147,7 @@ impl Write for StdoutLock<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.inner.write(buf)
     }
+
     fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
     }

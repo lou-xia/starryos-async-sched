@@ -1,6 +1,6 @@
+use alloc::vec::Vec;
 use core::{ops::Deref, ptr::NonNull};
 
-use alloc::vec::Vec;
 use axerrno::AxError;
 use axhal::mem::{PhysAddr, phys_to_virt};
 use rdrive::{

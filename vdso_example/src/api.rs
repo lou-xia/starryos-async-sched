@@ -1,9 +1,8 @@
-use core::mem::MaybeUninit;
-use core::sync::atomic::Ordering;
+use core::{mem::MaybeUninit, sync::atomic::Ordering};
 
 use vdso_helper::get_vvar_data;
 
-use crate::{interface, ArgumentExample, PRIVATE_DATA_EXAMPLE};
+use crate::{ArgumentExample, PRIVATE_DATA_EXAMPLE, interface};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn get_shared() -> ArgumentExample {

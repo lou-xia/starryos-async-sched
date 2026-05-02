@@ -21,17 +21,16 @@
 //! 3. 函数的参数和返回值用到的自定义数据结构，均需要声明为`pub`和`#[repr(C)]`（例如此处的`ArgumentExample`）。
 //! 4. 该库导出的所有函数和数据结构均需要导出在根模块中。
 //!     （例如，导出子模块中的`pub`符号时，需要使用`pub use submod::*;`，而非`pub use submod;`）
-//!
 #![no_std]
 
 mod api;
 mod interface;
 
 use core::sync::atomic::AtomicUsize;
-use vdso_helper::vvar_data;
 
 pub use api::*;
 pub use interface::*;
+use vdso_helper::vvar_data;
 
 vvar_data! {
     example: AtomicUsize

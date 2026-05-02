@@ -4,5 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-vdso_helper = { path = "../../vdso_crate_template/vdso_crate_template/vdso_helper" }
+# vdso_helper = { path = "../../vdso_crate_template/vdso_crate_template/vdso_helper" }
+vdso_helper = { git = "https://github.com/rosy233333/vdso_crate_template", package = "vdso_helper" }
 lazyinit = "0.2"
