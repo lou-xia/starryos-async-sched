@@ -326,7 +326,7 @@ impl TaskInner {
     }
 
     #[inline]
-    pub(crate) fn set_state(&self, state: TaskState) {
+    pub fn set_state(&self, state: TaskState) {
         self.state.store(state as u8, Ordering::Release)
     }
 

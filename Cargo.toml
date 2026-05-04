@@ -1,7 +1,14 @@
 [workspace]
 resolver = "2"
 members = ["api", "core"]
-exclude = ["arceos", "vdso_output/vdso_wrapper", "vdso_output/libvdsoexample", "tests"]
+exclude = [
+    "arceos",
+    "vdso_output/vdso_wrapper",
+    "vdso_output/libvdsoexample",
+    "tests",
+    "vdso_vsched2_output/vdso_wrapper",
+    "vdso_vsched2_output/libvsched2"
+]
 
 [workspace.package]
 version = "0.1.0"

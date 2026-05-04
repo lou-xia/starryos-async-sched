@@ -52,5 +52,10 @@ xmas-elf = "0.9"
 #asynctask.workspace = true
 vdso.workspace = true
 
+# 依赖 build_vdso 生成的 libvsched2 包装库，
+# 该库提供了 vsched2 中 trait_interface! 生成的 init_vtable_* 函数（extern "C"），
+# 用于 core/src/vsched.rs 中初始化 vsched2 调度器的接口实现。
+libvsched2 = { path = "../vdso_vsched2_output/libvsched2" }
+
 [target.'cfg(not(any(target_arch = "aarch64", target_arch = "loongarch64")))'.dependencies]
 axmm = { workspace = true, features = ["copy"] }

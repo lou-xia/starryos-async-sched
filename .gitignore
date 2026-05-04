@@ -15,4 +15,5 @@
 *.swo
 
 /vdso_output
+/vdso_vsched2_output
 /mydoc

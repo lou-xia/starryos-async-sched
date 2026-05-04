@@ -1579,6 +1579,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "libvsched2"
+version = "0.0.0"
+dependencies = [
+ "crate_interface 0.2.0",
+ "elf_parser",
+ "include_bytes_aligned",
+ "lazyinit",
+ "page_table_entry",
+ "vsched2",
+ "xmas-elf",
+]
+
+[[package]]
 name = "linked_list_r4l"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2324,6 +2337,7 @@ dependencies = [
  "kernel_guard",
  "kspin",
  "lazy_static",
+ "libvsched2",
  "linkme",
  "linux-raw-sys",
  "lock_api",
@@ -2652,6 +2666,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.114",
+]
+
+[[package]]
+name = "vsched2"
+version = "0.1.0"
+dependencies = [
+ "heapless 0.9.2",
+ "lazyinit",
+ "spin 0.10.0",
+ "vdso_helper",
 ]
 
 [[package]]
