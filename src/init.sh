@@ -14,7 +14,7 @@ echo
 # cd ~
 # sh --login
 cd /tests/target/riscv64gc-unknown-linux-musl/release/
-./vdso_test
+./vipc_test
 cd /
 rm -rf /tests
 exit

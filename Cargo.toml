@@ -7,7 +7,9 @@ exclude = [
     "vdso_output/libvdsoexample",
     "tests",
     "vdso_vsched2_output/vdso_wrapper",
-    "vdso_vsched2_output/libvsched2"
+    "vdso_vsched2_output/libvsched2",
+    "vdso_vqueue_output/vdso_wrapper",
+    "vdso_vqueue_output/libvqueue",
 ]
 
 [workspace.package]

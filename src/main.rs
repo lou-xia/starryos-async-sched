@@ -19,9 +19,8 @@ pub const CMDLINE: &[&str] = &["/bin/sh", "-c", include_str!("init.sh")];
 #[unsafe(no_mangle)]
 fn main() {
     starry_api::init();
-    starry_core::vsched::init_vsched2_interfaces();
-
     vdso::vdso_init();
+    // starry_core::vsched::init_vsched2_interfaces();
 
     let args = CMDLINE
         .iter()

@@ -2,29 +2,26 @@
 
 use axalloc::{UsageKind, global_allocator};
 use axhal::mem::{phys_to_virt, virt_to_phys};
-use axlog::{ax_println, info};
+use axlog::ax_println;
 use axmm::{AddrSpace, kernel_aspace};
-pub use libvdsoexample::*;
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr, VirtAddrRange, align_up_4k};
-use vdso_example::VvarData as LocalVvarData;
+pub use libvqueue::*;
+// pub use libvsched2::*;
 
 pub static mut VDSO_START_PA: usize = 0;
 pub static mut VDSO_SIZE: usize = 0;
 pub static mut VVAR_START_PA: usize = 0;
 pub static mut VVAR_SIZE: usize = 0;
 
-struct MemImpl;
+// const VDSO_IMAGE: &[u8] = include_bytes!("../../vdso_vsched2_output/libvsched2.so");
+const VDSO_IMAGE: &[u8] = include_bytes!("../../vdso_vqueue_output/libvqueue.so");
 
-/// 生成出的 vDSO 镜像文件。
-const VDSO_IMAGE: &[u8] = include_bytes!("../../vdso_output/libvdsoexample.so");
-
-/// 生成器会额外为未出现在文件中的段预留一页，因此这里和 loader 中的计算保持一致。
 const VDSO_RESERVED_SIZE: usize = align_up_4k(VDSO_IMAGE.len()) + PAGE_SIZE_4K;
 
-/// vVAR 区只需要容纳导出的共享数据结构。
-const VVAR_RESERVED_SIZE: usize = align_up_4k(core::mem::size_of::<LocalVvarData>());
+const VVAR_RESERVED_SIZE: usize = align_up_4k(core::mem::size_of::<VvarData>());
 
-/// `build_vdso` 新接口使用裸 `usize` 传递目标地址空间，这里统一恢复为 `AddrSpace`。
+struct MemImpl;
+
 fn aspace_from_vspace(vspace: usize) -> &'static mut AddrSpace {
     assert_ne!(vspace, 0, "vdso: vspace must not be null");
     unsafe { &mut *(vspace as *mut AddrSpace) }
@@ -48,8 +45,6 @@ impl MemIf for MemImpl {
             .as_mut_ptr()
     }
 
-    /// 当前实现用一段连续内核虚拟地址承载物理页，并把该虚拟地址本身作为 `PhysPagePtr`。
-    /// 后续 `map()` 时再将其还原为物理地址，这样无需修改生成器接口即可复用现有页分配器。
     fn ppage_alloc(size: usize) -> PhysPagePtr {
         let num_pages = size / PAGE_SIZE_4K;
         let kva = global_allocator()
@@ -106,37 +101,16 @@ impl MemIf for MemImpl {
     }
 }
 
-struct TestImpl(usize);
-
-impl TestIf for TestImpl {
-    fn test_fn1(&self, arg: usize) -> usize {
-        info!("test_fn1 called with arg: {}, self.0: {}", arg, self.0);
-        self.0 + arg
-    }
-
-    fn test_fn2(&mut self, arg: usize) -> usize {
-        info!("test_fn2 called with arg: {}, self.0: {}", arg, self.0);
-        self.0 += arg;
-        self.0
-    }
-
-    fn test_fn3(arg: usize) {
-        info!("test_fn3 called with arg: {}", arg);
-    }
-}
-
 pub fn vdso_init() {
-    info!("Starting VDSO test...");
     // 首次加载到内核地址空间，同时初始化内核侧的 vDSO 函数表。
     let vdso_start = {
         let mut aspace = kernel_aspace().lock();
         let vspace = (&mut *aspace) as *mut AddrSpace as usize;
         let vdso = map_so(vspace);
-        unsafe { init_vdso_vtable(vdso as _) };
+        unsafe { init_vdso_vtable(vdso as u64) };
         vdso
     };
 
-    // loader 约定 vVAR 紧邻在 vDSO 前面，因此这里按同一布局回填导出给其余模块使用的元数据。
     let vvar_start = unsafe { vdso_start.sub(VVAR_RESERVED_SIZE) };
     unsafe {
         VVAR_START_PA = usize::from(virt_to_phys(VirtAddr::from(vvar_start as usize)));
@@ -145,17 +119,10 @@ pub fn vdso_init() {
         VDSO_SIZE = VDSO_RESERVED_SIZE;
     };
     ax_println!(
-        "VDSO and vVAR initialized: VVAR at 0x{:016x} (size: {}), VDSO at 0x{:016x} (size: {})",
+        "VDSO and vVAR initialized:\n  VVAR at 0x{:016x} (size: {:#x})\n  VDSO at 0x{:016x} (size: {:#x})",
         unsafe { VVAR_START_PA },
         unsafe { VVAR_SIZE },
         unsafe { VDSO_START_PA },
         unsafe { VDSO_SIZE }
     );
-    init_vtable_TestIf::<TestImpl>();
-    let mut test_impl = TestImpl(10);
-    let ptr = &mut test_impl as *mut TestImpl as *mut ();
-    test_call(ptr);
-    ax_println!("Test passed!");
-    set_shared(100);
-    set_private(200);
 }

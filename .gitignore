@@ -16,4 +16,5 @@
 
 /vdso_output
 /vdso_vsched2_output
+/vdso_vqueue_output
 /mydoc
