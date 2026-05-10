@@ -11,10 +11,10 @@ echo
 
 # Do your initialization here!
 
-# cd ~
-# sh --login
 cd /tests/target/riscv64gc-unknown-linux-musl/release/
 ./vipc_test
 cd /
 rm -rf /tests
 exit
+# cd ~
+# sh --login

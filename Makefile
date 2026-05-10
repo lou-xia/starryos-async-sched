@@ -53,12 +53,14 @@ defconfig justrun clean:
 	@make -C arceos $@
 
 build run debug disasm: defconfig
+	@rm -f .axconfig.toml
 	@make -C arceos $@
 
 uapp:
 	cd tests && $(MAKE) build_uapps
 
 test: uapp copy_tests
+	@rm -f .axconfig.toml
 	@make -C arceos run
 
 # Aliases

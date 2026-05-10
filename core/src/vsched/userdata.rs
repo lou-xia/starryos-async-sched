@@ -25,7 +25,7 @@ fn find_user_vaddr_for_phys(aspace: &AddrSpace, target: PhysAddr) -> Option<Virt
 }
 
 impl libvsched2::UserData for VschedUserDataImpl {
-    fn get_user_data(pos: usize, len: usize) -> *mut () {
+    fn get_user_data(pos: usize, len: usize, vspace: Option<*mut ()>) -> *mut () {
         let vvar_start_pa = unsafe { VSCHED2_VVAR_START_PA };
         let vvar_size = unsafe { VSCHED2_VVAR_SIZE };
 
@@ -45,16 +45,27 @@ impl libvsched2::UserData for VschedUserDataImpl {
         }
 
         let offset = pos - kernel_vvar_start;
-
-        let current = axtask::current();
-        let Some(thr) = current.try_as_thread() else {
-            return core::ptr::null_mut();
-        };
-
-        let aspace = thr.proc_data.aspace.lock();
         let target_page_pa = PhysAddr::from((vvar_start_pa + offset) & !0xfff);
-        let Some(user_page) = find_user_vaddr_for_phys(&aspace, target_page_pa) else {
-            return core::ptr::null_mut();
+
+        let user_page = if let Some(vspace_ptr) = vspace {
+            if vspace_ptr.is_null() {
+                return core::ptr::null_mut();
+            }
+            let aspace_ref = unsafe { &*(vspace_ptr as *const AddrSpace) };
+            let Some(page) = find_user_vaddr_for_phys(aspace_ref, target_page_pa) else {
+                return core::ptr::null_mut();
+            };
+            page
+        } else {
+            let current = axtask::current();
+            let Some(thr) = current.try_as_thread() else {
+                return core::ptr::null_mut();
+            };
+            let aspace = thr.proc_data.aspace.lock();
+            let Some(page) = find_user_vaddr_for_phys(&aspace, target_page_pa) else {
+                return core::ptr::null_mut();
+            };
+            page
         };
 
         (user_page.as_usize() + offset % 4096) as *mut ()
