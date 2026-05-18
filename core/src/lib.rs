@@ -22,4 +22,5 @@ pub mod task;
 pub mod time;
 pub mod vfs;
 // pub mod vipc;
+#[allow(missing_docs)]
 pub mod vsched;

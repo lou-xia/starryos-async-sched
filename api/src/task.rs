@@ -246,3 +246,101 @@ fn syscall_task(mut uctx: UserContext, finish: Arc<AtomicBool>) {
     );
     spawn_task(task);
 }
+
+use starry_core::vsched::trapframe::UserTrapFrame;
+use starry_core::vsched::task::VschedTaskImpl;
+
+use axhal::paging::MappingFlags;
+use memory_addr::VirtAddr;
+
+fn vsched_trap_dispatcher(trapped_task: *const VschedTaskImpl) {
+    let vti = unsafe { &*trapped_task };
+    let tf_ptr = vti.trap_frame.load(Ordering::Acquire);
+    if tf_ptr == 0 {
+        return;
+    }
+    let tf = unsafe { &*(tf_ptr as *const UserTrapFrame) };
+
+    match tf.scause {
+        12 | 13 | 15 => {
+            let vaddr = VirtAddr::from(tf.stval);
+            let flags = match tf.scause {
+                12 => MappingFlags::EXECUTE | MappingFlags::USER,
+                13 => MappingFlags::READ | MappingFlags::USER,
+                _ => MappingFlags::WRITE | MappingFlags::USER,
+            };
+            if let Some(thr) = vti.task.try_as_thread() {
+                if !thr.proc_data.aspace.lock().handle_page_fault(vaddr, flags) {
+                    raise_signal_fatal(SignalInfo::new_kernel(Signo::SIGSEGV)).ok();
+                }
+            }
+        }
+        8 => {
+            let mut uctx = UserContext::new(
+                tf.sepc + 4,
+                VirtAddr::from(tf.regs.sp),
+                tf.regs.a0,
+            );
+            uctx.set_arg1(tf.regs.a1);
+            uctx.set_arg2(tf.regs.a2);
+            uctx.set_arg3(tf.regs.a3);
+            uctx.set_arg4(tf.regs.a4);
+            uctx.set_arg5(tf.regs.a5);
+            uctx.set_sysno(tf.regs.a7);
+            uctx.set_ra(tf.regs.ra);
+            uctx.set_tls(tf.regs.tp);
+
+            axtask::with_current_task(&vti.task, || {
+                handle_syscall(&mut uctx);
+            });
+
+            let tf_mut = unsafe { &mut *(tf_ptr as *mut UserTrapFrame) };
+            tf_mut.regs = unsafe { core::mem::transmute_copy(&uctx.regs) };
+            tf_mut.sepc = uctx.ip();
+            tf_mut.sstatus = uctx.sstatus.bits();
+        }
+        1 | 5 | 7 => {
+            axlog::error!(
+                "vsched trap: memory access fault scause={}, vaddr={:#x}, task={}",
+                tf.scause,
+                tf.stval,
+                vti.task.id_name(),
+            );
+            raise_signal_fatal(SignalInfo::new_kernel(Signo::SIGSEGV)).ok();
+        }
+        2 => {
+            axlog::error!(
+                "vsched trap: illegal instruction @ {:#x}, task={}",
+                tf.sepc,
+                vti.task.id_name(),
+            );
+            raise_signal_fatal(SignalInfo::new_kernel(Signo::SIGILL)).ok();
+        }
+        3 => {
+            raise_signal_fatal(SignalInfo::new_kernel(Signo::SIGTRAP)).ok();
+        }
+        0 | 4 | 6 => {
+            axlog::error!(
+                "vsched trap: misaligned access scause={}, vaddr={:#x}, task={}",
+                tf.scause,
+                tf.stval,
+                vti.task.id_name(),
+            );
+            raise_signal_fatal(SignalInfo::new_kernel(Signo::SIGBUS)).ok();
+        }
+        _ => {
+            axlog::warn!(
+                "vsched trap handler: unhandled scause={}, stval={:#x}, sepc={:#x}, task={}",
+                tf.scause,
+                tf.stval,
+                tf.sepc,
+                vti.task.id_name(),
+            );
+            raise_signal_fatal(SignalInfo::new_kernel(Signo::SIGTRAP)).ok();
+        }
+    }
+}
+
+pub fn register_vsched_trap_dispatcher() {
+    starry_core::vsched::trap::register_trap_dispatcher(vsched_trap_dispatcher);
+}

@@ -5,11 +5,12 @@ use axtask::TaskState as AxTaskState;
 use libvsched2;
 use vdso;
 
-mod context;
+pub mod context;
 mod smp;
 mod stack;
-mod task;
-mod trap;
+pub mod task;
+pub mod trap;
+pub mod trapframe;
 mod userdata;
 
 pub use task::{CoroutinePoll, register_task, task_from_raw, VschedTaskImpl};

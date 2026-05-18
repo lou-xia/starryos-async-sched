@@ -32,4 +32,6 @@ pub fn init() {
 
     info!("Initialize alarm...");
     starry_core::time::spawn_alarm_task();
+
+    crate::task::register_vsched_trap_dispatcher();
 }

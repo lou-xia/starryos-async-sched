@@ -1,6 +1,9 @@
 use axmm::AddrSpace;
 use memory_addr::PhysAddr;
 
+use super::trapframe::UserTrapFrame;
+use super::task::VschedTaskImpl;
+
 pub struct VschedContextImpl;
 
 pub struct VschedVSpaceImpl;
@@ -28,20 +31,55 @@ pub fn page_table_root_from_raw(ptr: *const ()) -> Option<PhysAddr> {
     Some(root)
 }
 
+pub const VSCHED2_INTO_KERNEL_SYSNO: usize = 0xdead;
+
 impl libvsched2::Context for VschedContextImpl {
-    // TODO
     fn into_kernel() -> ! {
-        panic!("VschedContextImpl::into_kernel: vsched2 trap entry not yet integrated");
+        #[cfg(target_arch = "riscv64")]
+        unsafe {
+            core::arch::asm!(
+                "ecall",
+                in("a7") VSCHED2_INTO_KERNEL_SYSNO,
+                options(noreturn),
+            );
+        }
+        #[cfg(not(target_arch = "riscv64"))]
+        {
+            unimplemented!("VschedContextImpl::into_kernel: unsupported architecture");
+        }
     }
 
-    // TODO
-    fn into_user(_ustack: usize) {
-        panic!("VschedContextImpl::into_user: vsched2 user trampoline not yet integrated");
+    fn into_user(ustack: usize) {
+        // TODO: resolve raw_run_task address from vsched2 vDSO .dynsym
+        let entry: usize = 0;
+
+        #[cfg(target_arch = "riscv64")]
+        unsafe {
+            core::arch::asm!(
+                "csrw   sepc, {entry}",
+                "li     t0, (1 << 8)",
+                "csrc   sstatus, t0",
+                "mv     sp, {sp}",
+                "sret",
+                entry = in(reg) entry,
+                sp = in(reg) ustack,
+                options(noreturn),
+            );
+        }
+        #[cfg(not(target_arch = "riscv64"))]
+        {
+            unimplemented!("VschedContextImpl::into_user: unsupported architecture");
+        }
     }
 
-    // TODO
-    fn into_user_context(_task: *const ()) {
-        panic!("VschedContextImpl::into_user_context: vsched2 user trampoline not yet integrated");
+    fn into_user_context(task: *const ()) {
+        let tf_ptr = unsafe {
+            let vsched_task = &*(task as *const VschedTaskImpl);
+            vsched_task.trap_frame.load(core::sync::atomic::Ordering::Acquire)
+        };
+        assert_ne!(tf_ptr, 0, "into_user_context: trap_frame is null");
+        let tf = unsafe { &*(tf_ptr as *const UserTrapFrame) };
+        unsafe { tf.restore_and_sret() };
     }
 
     fn switch_vspace(vspace_pid: *const ()) {

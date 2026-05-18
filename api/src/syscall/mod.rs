@@ -20,6 +20,14 @@ use self::{
 };
 
 pub fn handle_syscall(uctx: &mut UserContext) {
+    if uctx.sysno() == starry_core::vsched::context::VSCHED2_INTO_KERNEL_SYSNO {
+        // TODO: route to vsched2 raw_utok_schedule via the vsched2 trap entry path
+        // For now the user task that issued this ecall will be parked; the vsched2
+        // kernel scheduler should take over and schedule the next task.
+        debug!("vsched2 into_kernel ecall intercepted");
+        return;
+    }
+
     let Some(sysno) = Sysno::new(uctx.sysno()) else {
         warn!("Invalid syscall number: {}", uctx.sysno());
         uctx.set_retval(-LinuxError::ENOSYS.code() as _);

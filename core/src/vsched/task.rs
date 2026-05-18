@@ -4,6 +4,8 @@ use core::task::Poll;
 
 use axtask::{AxTaskRef, TaskState as AxTaskState};
 
+use super::trapframe::{UserTrapFrame, UserTrapFrameKind};
+
 use crate::config;
 
 use super::{from_vsched_state, to_vsched_state};
@@ -20,6 +22,7 @@ pub struct VschedTaskImpl {
     pub return_value: AtomicUsize,
     pub thread_stack_base: AtomicUsize,
     pub coroutine: Option<Arc<dyn CoroutinePoll>>,
+    pub trap_frame: AtomicUsize,
 }
 
 impl VschedTaskImpl {
@@ -37,6 +40,7 @@ impl VschedTaskImpl {
             return_value: AtomicUsize::new(0),
             thread_stack_base: AtomicUsize::new(0),
             coroutine,
+            trap_frame: AtomicUsize::new(0),
         }
     }
 
@@ -72,23 +76,29 @@ impl libvsched2::Task for VschedTaskImpl {
         self.pid.store(pid, Ordering::Release);
     }
 
-    // TODO
     fn save_thread_context(&self) {
+        let tf_ptr = self.trap_frame.load(Ordering::Acquire);
+        if tf_ptr != 0 {
+            let tf = unsafe { &mut *(tf_ptr as *mut UserTrapFrame) };
+            tf.kind = UserTrapFrameKind::Yield;
+        }
         self.task.set_state(AxTaskState::Ready);
     }
 
-    // TODO
     fn save_trap_context(&self) {
+        let tf_ptr = self.trap_frame.load(Ordering::Acquire);
+        if tf_ptr != 0 {
+            let tf = unsafe { &mut *(tf_ptr as *mut UserTrapFrame) };
+            tf.kind = UserTrapFrameKind::Trap;
+        }
         self.task.set_state(AxTaskState::Blocked);
     }
 
-    // TODO
     fn restore_context(&self) {
-        panic!(
-            "VschedTaskImpl::restore_context: vsched2 context switching not yet integrated. \
-             task={}",
-            self.task.id_name()
-        );
+        let tf_ptr = self.trap_frame.load(Ordering::Acquire);
+        assert_ne!(tf_ptr, 0, "restore_context: trap_frame is null");
+        let tf = unsafe { &*(tf_ptr as *const UserTrapFrame) };
+        unsafe { tf.restore_and_jump() };
     }
 
     fn poll(&self) -> Poll<usize> {

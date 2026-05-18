@@ -12,7 +12,15 @@ use crate::config;
 use super::task::{CoroutinePoll, VschedTaskImpl};
 use super::{register_task, to_vsched_state, HIGHEST_PRIORITY};
 
-const TRAP_HANDLER_POOL_CAP: usize = 10;
+type TrapDispatcher = fn(trapped_task: *const VschedTaskImpl);
+
+static TRAP_DISPATCHER: AtomicUsize = AtomicUsize::new(0);
+
+pub fn register_trap_dispatcher(dispatcher: TrapDispatcher) {
+    TRAP_DISPATCHER.store(dispatcher as usize, Ordering::Release);
+}
+
+const TRAP_HANDLER_POOL_CAP: usize = 8;
 
 lazy_static! {
     static ref TRAP_HANDLER_POOL: Mutex<Vec<usize>> = Mutex::new(Vec::new());
@@ -24,8 +32,15 @@ struct TrapHandlerCoroutine {
 
 impl CoroutinePoll for TrapHandlerCoroutine {
     fn poll(&self) -> Poll<usize> {
-        let _trapped_task = self.trapped_task.swap(0, Ordering::AcqRel) as *const ();
-        // TODO
+        let trapped_task = self.trapped_task.swap(0, Ordering::AcqRel) as *const VschedTaskImpl;
+        if trapped_task.is_null() {
+            return Poll::Ready(0);
+        }
+        let dispatcher = TRAP_DISPATCHER.load(Ordering::Acquire);
+        if dispatcher != 0 {
+            let dispatcher: TrapDispatcher = unsafe { core::mem::transmute(dispatcher) };
+            dispatcher(trapped_task);
+        }
         Poll::Ready(0)
     }
 }

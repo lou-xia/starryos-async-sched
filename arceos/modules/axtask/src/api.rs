@@ -171,6 +171,31 @@ pub fn set_priority(prio: isize) -> bool {
     current_run_queue::<NoPreemptIrqSave>().set_current_priority(prio)
 }
 
+/// Temporarily override the current task for the duration of `f`.
+///
+/// All calls to [`current()`] inside `f` will return `task`.
+/// The original current task is restored after `f` returns.
+///
+/// This is useful when running code that assumes a specific task is
+/// "current" — for example, syscall handlers that call [`current()`]
+/// to access process data.
+pub fn with_current_task<R>(task: &AxTaskRef, f: impl FnOnce() -> R) -> R {
+    let old_ptr = axhal::percpu::current_task_ptr::<super::AxTask>();
+    assert!(!old_ptr.is_null(), "with_current_task: no current task");
+
+    let new_ptr = Arc::into_raw(task.clone());
+    unsafe { axhal::percpu::set_current_task_ptr(new_ptr) };
+
+    let result = f();
+
+    let current_new = axhal::percpu::current_task_ptr::<super::AxTask>();
+    debug_assert_eq!(current_new, new_ptr, "with_current_task: current changed during f");
+    unsafe { Arc::from_raw(current_new) };
+    unsafe { axhal::percpu::set_current_task_ptr(old_ptr) };
+
+    result
+}
+
 /// Set the affinity for the current task.
 /// [`AxCpuMask`] is used to specify the CPU affinity.
 /// Returns `true` if the affinity is set successfully.
