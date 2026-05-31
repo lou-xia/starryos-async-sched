@@ -50,8 +50,11 @@ impl libvsched2::Context for VschedContextImpl {
     }
 
     fn into_user(ustack: usize) {
-        // TODO: resolve raw_run_task address from vsched2 vDSO .dynsym
-        let entry: usize = 0;
+        let entry = unsafe {
+            libvsched2::VDSO_VTABLE
+                .raw_run_task
+                .expect("VDSO_VTABLE.raw_run_task not initialized") as usize
+        };
 
         #[cfg(target_arch = "riscv64")]
         unsafe {

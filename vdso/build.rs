@@ -24,6 +24,7 @@ fn main() {
     config.out_dir = String::from("../vdso_vsched2_output");
     config.toolchain = String::from("nightly-2025-12-12");
     config.verbose = 2;
+    config.features = vec![String::from("vdso_only")];
     build_vdso(&config);
 
     let mut config = BuildConfig::new("/home/lou-xia/lou-xia/StarryOS/vqueue_vdso", "vqueue");
