@@ -859,7 +859,6 @@ checksum = "a7913f22349ffcfc6ca0ca9a656ec26cfbba538ed49c31a273dff2c5d1ea83d9"
 [[package]]
 name = "build_vdso"
 version = "0.1.0"
-source = "git+https://github.com/rosy233333/vdso_crate_template#1fb92ad3ab4cdf733b730af1e5f2b4859fd43e80"
 dependencies = [
  "regex",
  "xmas-elf",
@@ -2616,7 +2615,7 @@ dependencies = [
 [[package]]
 name = "vdso_helper"
 version = "0.1.0"
-source = "git+https://github.com/rosy233333/vdso_crate_template#1fb92ad3ab4cdf733b730af1e5f2b4859fd43e80"
+source = "git+https://github.com/rosy233333/vdso_crate_template#a81f4e4312cc54e26bb30b9fc5796896e2815241"
 dependencies = [
  "lazyinit",
  "paste",

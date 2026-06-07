@@ -84,12 +84,6 @@ impl libvsched2::Context for VschedContextImpl {
         let tf = unsafe { &*(tf_ptr as *const UserTrapFrame) };
         unsafe { tf.restore_and_sret() };
     }
-
-    fn switch_vspace(vspace_pid: *const ()) {
-        if let Some(root) = page_table_root_from_raw(vspace_pid) {
-            activate_user_aspace(root);
-        }
-    }
 }
 
 impl libvsched2::VSpace for VschedVSpaceImpl {

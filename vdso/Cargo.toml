@@ -17,5 +17,4 @@ axsync.workspace = true
 libvqueue = { path = "../vdso_vqueue_output/libvqueue" }
 
 [build-dependencies]
-# build_vdso = { path = "../../vdso_crate_template/vdso_crate_template/build_vdso" }
-build_vdso = { git = "https://github.com/rosy233333/vdso_crate_template", package = "build_vdso" }
+build_vdso = { path = "../../vdso_crate_template/vdso_crate_template/build_vdso" }

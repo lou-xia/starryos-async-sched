@@ -54,7 +54,7 @@ impl MemIf for MemImpl {
         kva
     }
 
-    fn map(vspace: usize, vaddr: *mut u8, ppage: PhysPagePtr, size: usize, flags: MappingFlags) {
+    fn map(vspace: usize, vaddr: *mut u8, ppage: PhysPagePtr, size: usize, flags: MappingFlags, _shared: bool) {
         let aspace = aspace_from_vspace(vspace);
         aspace
             .map_linear(

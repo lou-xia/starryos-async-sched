@@ -11,7 +11,7 @@ use crate::config;
 use super::{from_vsched_state, to_vsched_state};
 
 pub trait CoroutinePoll: Send + Sync {
-    fn poll(&self) -> Poll<usize>;
+    fn poll(&self) -> Poll<isize>;
 }
 
 pub struct VschedTaskImpl {
@@ -19,7 +19,7 @@ pub struct VschedTaskImpl {
     pub priority: AtomicIsize,
     pub pid: AtomicUsize,
     pub is_coroutine: AtomicBool,
-    pub return_value: AtomicUsize,
+    pub return_value: AtomicIsize,
     pub thread_stack_base: AtomicUsize,
     pub coroutine: Option<Arc<dyn CoroutinePoll>>,
     pub trap_frame: AtomicUsize,
@@ -37,7 +37,7 @@ impl VschedTaskImpl {
             priority: AtomicIsize::new(priority),
             pid: AtomicUsize::new(pid),
             is_coroutine: AtomicBool::new(coroutine.is_some()),
-            return_value: AtomicUsize::new(0),
+            return_value: AtomicIsize::new(0),
             thread_stack_base: AtomicUsize::new(0),
             coroutine,
             trap_frame: AtomicUsize::new(0),
@@ -68,6 +68,10 @@ impl libvsched2::Task for VschedTaskImpl {
         self.is_coroutine.load(Ordering::Acquire)
     }
 
+    fn is_kernel(&self) -> bool {
+        self.pid.load(Ordering::Acquire) == 0
+    }
+
     fn pid(&self) -> usize {
         self.pid.load(Ordering::Acquire)
     }
@@ -76,22 +80,11 @@ impl libvsched2::Task for VschedTaskImpl {
         self.pid.store(pid, Ordering::Release);
     }
 
-    fn save_thread_context(&self) {
-        let tf_ptr = self.trap_frame.load(Ordering::Acquire);
-        if tf_ptr != 0 {
-            let tf = unsafe { &mut *(tf_ptr as *mut UserTrapFrame) };
-            tf.kind = UserTrapFrameKind::Yield;
+    fn resched(&self) {
+        unsafe extern "C" {
+            fn vsched_yield_trampoline();
         }
-        self.task.set_state(AxTaskState::Ready);
-    }
-
-    fn save_trap_context(&self) {
-        let tf_ptr = self.trap_frame.load(Ordering::Acquire);
-        if tf_ptr != 0 {
-            let tf = unsafe { &mut *(tf_ptr as *mut UserTrapFrame) };
-            tf.kind = UserTrapFrameKind::Trap;
-        }
-        self.task.set_state(AxTaskState::Blocked);
+        unsafe { vsched_yield_trampoline() };
     }
 
     fn restore_context(&self) {
@@ -101,7 +94,7 @@ impl libvsched2::Task for VschedTaskImpl {
         unsafe { tf.restore_and_jump() };
     }
 
-    fn poll(&self) -> Poll<usize> {
+    fn poll(&self) -> Poll<isize> {
         match self.coroutine.as_ref() {
             Some(coro) => {
                 let polled = coro.poll();
@@ -120,7 +113,7 @@ impl libvsched2::Task for VschedTaskImpl {
         self.thread_stack_base.load(Ordering::Acquire)
     }
 
-    fn set_return_value(&self, value: usize) {
+    fn set_return_value(&self, value: isize) {
         self.return_value.store(value, Ordering::Release);
     }
 }
