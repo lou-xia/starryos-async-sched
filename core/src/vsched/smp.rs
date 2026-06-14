@@ -1,3 +1,5 @@
+//! VschedSmpImpl — vsched2 SMP 接口实现。
+
 use axhal::percpu::this_cpu_id;
 
 pub struct VschedSmpImpl;

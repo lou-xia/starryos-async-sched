@@ -5,16 +5,14 @@ use axhal::mem::{phys_to_virt, virt_to_phys};
 use axlog::ax_println;
 use axmm::{AddrSpace, kernel_aspace};
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr, VirtAddrRange, align_up_4k};
-pub use libvqueue::*;
-// pub use libvsched2::*;
+pub use libvsched2::*;
 
 pub static mut VDSO_START_PA: usize = 0;
 pub static mut VDSO_SIZE: usize = 0;
 pub static mut VVAR_START_PA: usize = 0;
 pub static mut VVAR_SIZE: usize = 0;
 
-// const VDSO_IMAGE: &[u8] = include_bytes!("../../vdso_vsched2_output/libvsched2.so");
-const VDSO_IMAGE: &[u8] = include_bytes!("../../vdso_vqueue_output/libvqueue.so");
+const VDSO_IMAGE: &[u8] = include_bytes!("../../vdso_vsched2_output/libvsched2.so");
 
 const VDSO_RESERVED_SIZE: usize = align_up_4k(VDSO_IMAGE.len()) + PAGE_SIZE_4K;
 

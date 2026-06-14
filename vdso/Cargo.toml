@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+libvsched2 = { path = "../vdso_vsched2_output/libvsched2" }
 crate_interface = "0.2.0"
 axmm.workspace = true
 axhal.workspace = true
@@ -12,9 +13,6 @@ memory_addr.workspace = true
 axlog.workspace = true
 axerrno.workspace = true
 axsync.workspace = true
-
-# libvsched2 = { path = "../vdso_vsched2_output/libvsched2" }
-libvqueue = { path = "../vdso_vqueue_output/libvqueue" }
 
 [build-dependencies]
 build_vdso = { path = "../../vdso_crate_template/vdso_crate_template/build_vdso" }

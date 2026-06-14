@@ -1,15 +1,20 @@
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use alloc::alloc::{Layout, alloc};
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use alloc::string;
 
 use axtask::TaskState as AxTaskState;
+use axmm;
+use axhal::{mem::phys_to_virt, asm};
 
-use libvsched2;
+use libvsched2::{self, Stack as _};
 use vdso;
 
 pub mod context;
 mod smp;
-mod stack;
+pub mod stack;
 pub mod task;
 pub mod trap;
 pub mod trapframe;
@@ -44,6 +49,7 @@ pub fn from_vsched_state(s: libvsched2::TaskState) -> AxTaskState {
         libvsched2::TaskState::Ready => AxTaskState::Ready,
         libvsched2::TaskState::Running => AxTaskState::Running,
         libvsched2::TaskState::Blocked => AxTaskState::Blocked,
+        libvsched2::TaskState::Blocking => AxTaskState::Blocked,
         libvsched2::TaskState::Exited => AxTaskState::Exited,
     }
 }
@@ -74,6 +80,12 @@ unsafe extern "C" {
 }
 
 pub fn activate_vsched_trap_vector() {
+    // 必须先在 V_KSATP 中保存内核页表根，再替换 stvec，
+    // 否则替换后即刻发生的异常会读到 V_KSATP=0。
+    let ks = unsafe { asm::read_user_page_table() };
+    let satp_val = (8usize << 60) | (ks.as_usize() >> 12);
+    trap_vector::set_kernel_satp(satp_val);
+
     let init_stack = unsafe {
         alloc(Layout::from_size_align(config::KERNEL_STACK_SIZE, 16).unwrap())
     };
@@ -82,4 +94,76 @@ pub fn activate_vsched_trap_vector() {
         core::arch::asm!("csrw sscratch, {}", in(reg) init_stack);
         axhal::asm::write_trap_vector_base(vsched2_trap_vector as *const () as usize);
     }
+}
+
+pub fn push_task_to_kernel(task_ptr: *const ()) {
+    libvsched2::push_task_into_current(task_ptr, 0);
+}
+
+/// 分配一个用于 vsched2 的 Stack 对象
+pub fn alloc_stack() -> *mut () {
+    stack::VschedStackImpl::alloc()
+}
+
+pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace_ptr: Option<*mut *mut ()>) -> ! {
+    axhal::asm::disable_irqs();
+    init_vsched2_interfaces();
+
+    let curr = axtask::current();
+    let main_ptr = register_task(curr.clone(), HIGHEST_PRIORITY, 0, None);
+    // 分配一个 Stack 对象作为内核主任务的初始栈
+    let init_stack_ptr = alloc_stack();
+    unsafe { (main_ptr as *mut VschedTaskImpl).as_mut().unwrap() }
+        .thread_stack_ptr.store(init_stack_ptr as usize, Ordering::Release);
+
+    unsafe {
+        libvsched2::VDSO_VTABLE.kernel_init_main
+            .expect("kernel_init_main not in vtable")(
+                init_stack_ptr,
+                main_ptr as *const (),
+            );
+    }
+    axlog::ax_println!("vsched2: kernel_init_main done");
+
+    if let (Some(init_task_ptr), Some(vspace_ptr)) = (init_task_ptr, vspace_ptr) {
+        let kernel_root = unsafe { asm::read_user_page_table() };
+        let aspace_ptr = unsafe { *vspace_ptr };
+        if !aspace_ptr.is_null() {
+            let aspace = unsafe { &*(aspace_ptr as *const axmm::AddrSpace) };
+            let root = aspace.page_table_root();
+            if root.as_usize() != 0 && root != kernel_root {
+                unsafe {
+                    asm::write_user_page_table(root);
+                    asm::flush_tlb(None);
+                    core::arch::asm!("csrs sstatus, {}", in(reg) 1usize << 18);
+                }
+            }
+        }
+        axlog::ax_println!("vsched2: calling process_init...");
+        let pid = libvsched2::process_init(vspace_ptr);
+        axlog::ax_println!("vsched2: process_init pid={}", pid);
+        libvsched2::push_task_into_current(init_task_ptr, 0);
+        unsafe {
+            asm::write_user_page_table(kernel_root);
+            asm::flush_tlb(None);
+        }
+    }
+
+    activate_vsched_trap_vector();
+    axlog::ax_println!("vsched2: trap vector active, entering scheduler");
+
+    // 将所有最新内核映射同步到用户页表。
+    if let Some(vspace_ptr) = vspace_ptr {
+        let aspace_ptr = unsafe { *vspace_ptr };
+        if !aspace_ptr.is_null() {
+            let mut user_aspace = unsafe { &mut *(aspace_ptr as *mut axmm::AddrSpace) };
+            let kernel_aspace = axmm::kernel_aspace().lock();
+            let _ = user_aspace.copy_mappings_from(&kernel_aspace);
+        }
+    }
+
+    unsafe {
+        core::arch::asm!("call vsched_yield_trampoline", options(noreturn));
+    }
+    unreachable!()
 }

@@ -21,11 +21,8 @@ use self::{
 
 pub fn handle_syscall(uctx: &mut UserContext) {
     if uctx.sysno() == starry_core::vsched::context::VSCHED2_INTO_KERNEL_SYSNO {
-        // TODO: route to vsched2 raw_utok_schedule via the vsched2 trap entry path
-        // For now the user task that issued this ecall will be parked; the vsched2
-        // kernel scheduler should take over and schedule the next task.
-        debug!("vsched2 into_kernel ecall intercepted");
-        return;
+        debug!("vsched2 into_kernel ecall intercepted, routing to raw_trap_entry");
+        starry_core::vsched::context::enter_raw_trap_entry();
     }
 
     let Some(sysno) = Sysno::new(uctx.sysno()) else {

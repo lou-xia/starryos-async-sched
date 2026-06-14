@@ -3,6 +3,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::task::Poll;
 
+use axlog::ax_println;
 use axtask::TaskState as AxTaskState;
 
 use crate::config;
@@ -69,7 +70,7 @@ impl libvsched2::TrapInfo for VschedTrapInfoImpl {
                 .trap_handler
                 .expect("trap_handler not in vtable")
         };
-        let task_ref = axtask::spawn_raw(
+        let task_ref = axtask::new_raw(
             || {},
             alloc::string::String::from("trap_handler"),
             config::KERNEL_STACK_SIZE,
@@ -96,13 +97,12 @@ unsafe impl Sync for TrapHandlerCoroutine {}
 
 impl CoroutinePoll for TrapHandlerCoroutine {
     fn poll(&self) -> Poll<isize> {
+        axlog::ax_println!("[th] trap handler poll");
         let handler = self.handler_fn.load(Ordering::Acquire);
         let queue = self.queue.load(Ordering::Acquire);
         let handler: fn(*const ()) = unsafe { core::mem::transmute(handler) };
         handler(queue as *const ());
-        // trap_handler returns only when it calls resched(), which saves
-        // context and enters the scheduler. When this task is rescheduled,
-        // execution returns from resched() and continues inside trap_handler.
-        Poll::Ready(0)
+        axlog::ax_println!("[th] trap handler returned (unexpected!)");
+        Poll::Pending
     }
 }

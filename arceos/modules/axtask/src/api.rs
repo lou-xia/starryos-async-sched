@@ -135,6 +135,21 @@ where
     spawn_task(TaskInner::new(f, name, stack_size))
 }
 
+/// Creates a new task without adding it to the run queue.
+///
+/// Useful when the task will be managed by an external scheduler (e.g. vsched2).
+pub fn new_raw<F>(f: F, name: String, stack_size: usize) -> AxTaskRef
+where
+    F: FnOnce() + Send + 'static,
+{
+    TaskInner::new(f, name, stack_size).into_arc()
+}
+
+/// Wraps an existing TaskInner into AxTaskRef without adding it to the run queue.
+pub fn into_ref(task: TaskInner) -> AxTaskRef {
+    task.into_arc()
+}
+
 /// Spawns a new task with the given name and the default stack size ([`axconfig::TASK_STACK_SIZE`]).
 ///
 /// Returns the task reference.

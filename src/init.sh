@@ -12,7 +12,7 @@ echo
 # Do your initialization here!
 
 cd /tests/target/riscv64gc-unknown-linux-musl/release/
-./vipc_test
+./helloworld
 cd /
 rm -rf /tests
 exit

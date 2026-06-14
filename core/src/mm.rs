@@ -343,6 +343,8 @@ pub fn load_user_app(
     let vdso_start = VirtAddr::from(map_so(uspace_ptr) as usize);
     // warn!("vdso mapped at: {:#x}", vdso_start.as_usize());
 
+    crate::vsched::context::set_process_vdso_base(vdso_start.as_usize());
+
     auxv.push(AuxEntry::new(AuxType::SYSINFO_EHDR, vdso_start.into()));
 
     let stack_data = app_stack_region(args, envs, &auxv, ustack_top.into());

@@ -2600,7 +2600,7 @@ dependencies = [
  "axsync",
  "build_vdso",
  "crate_interface 0.2.0",
- "libvqueue",
+ "libvsched2",
  "memory_addr 0.4.1",
 ]
 

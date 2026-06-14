@@ -257,9 +257,11 @@ fn vsched_trap_dispatcher(trapped_task: *const VschedTaskImpl) {
     let vti = unsafe { &*trapped_task };
     let tf_ptr = vti.trap_frame.load(Ordering::Acquire);
     if tf_ptr == 0 {
+        axlog::ax_println!("[trap] task={} trap_frame=null", vti.task.id_name());
         return;
     }
     let tf = unsafe { &*(tf_ptr as *const UserTrapFrame) };
+    axlog::ax_println!("[trap] task={} scause={} sepc={:#x} stval={:#x}", vti.task.id_name(), tf.scause, tf.sepc, tf.stval);
 
     match tf.scause {
         12 | 13 | 15 => {

@@ -34,9 +34,9 @@ checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
 
 [[package]]
 name = "bitflags"
-version = "2.11.1"
+version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
+checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
 
 [[package]]
 name = "byteorder"
@@ -76,12 +76,12 @@ checksum = "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b"
 [[package]]
 name = "elf_parser"
 version = "0.1.0"
-source = "git+https://github.com/rosy233333/elf_parser.git#585c69df01c752aaeed5bffa6893f9761091550b"
+source = "git+https://github.com/rosy233333/elf_parser.git#7f07a2df3ece194cb0f6e249fe042ae70c063796"
 dependencies = [
  "axerrno",
  "cfg-if",
  "log",
- "memory_addr 0.1.0",
+ "memory_addr",
  "page_table_entry",
  "xmas-elf",
 ]
@@ -164,14 +164,9 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.29"
+version = "0.4.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
-
-[[package]]
-name = "memory_addr"
-version = "0.1.0"
-source = "git+https://github.com/Starry-OS/memory_addr.git#a5be547a3109f114994d005b893f9b19c2616709"
+checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
 name = "memory_addr"
@@ -186,8 +181,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dda9891ec368fda90e4b2cc36592b4881073e25a339fe7e3eddd811f0cf6bf18"
 dependencies = [
  "aarch64-cpu",
- "bitflags 2.11.1",
- "memory_addr 0.4.1",
+ "bitflags 2.13.0",
+ "memory_addr",
  "x86_64",
 ]
 
@@ -325,7 +320,7 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 [[package]]
 name = "vdso_helper"
 version = "0.1.0"
-source = "git+https://github.com/rosy233333/vdso_crate_template.git#3e18b53c4e1d3eca553ddf18216b68c4a9a938e0"
+source = "git+https://github.com/rosy233333/vdso_crate_template.git#a81f4e4312cc54e26bb30b9fc5796896e2815241"
 dependencies = [
  "lazyinit",
  "paste",
@@ -363,7 +358,7 @@ dependencies = [
  "aarch64-cpu",
  "cfg-if",
  "linkme",
- "memory_addr 0.4.1",
+ "memory_addr",
  "page_table_entry",
  "riscv",
  "static_assertions",
@@ -389,7 +384,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f7841fa0098ceb15c567d93d3fae292c49e10a7662b4936d5f6a9728594555ba"
 dependencies = [
  "bit_field",
- "bitflags 2.11.1",
+ "bitflags 2.13.0",
  "const_fn",
  "rustversion",
  "volatile",
