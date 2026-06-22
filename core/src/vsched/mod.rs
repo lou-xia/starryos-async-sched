@@ -140,8 +140,15 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace_ptr: Option<*m
     axhal::asm::disable_irqs();
     init_vsched2_interfaces();
 
+    // Redirect axtask::yield_now() to vsched2's yield trampoline,
+    // replacing the legacy AxRunQueue yield with vsched2 resched.
+    unsafe extern "C" {
+        fn vsched_yield_trampoline() -> !;
+    }
+    axtask::register_vsched2_yield(vsched_yield_trampoline);
+
     let curr = axtask::current();
-    let main_ptr = register_task(curr.clone(), HIGHEST_PRIORITY, 0, None);
+    let main_ptr = register_task(curr.clone(), LOWEST_PRIORITY, 0, None);
     // 分配一个 Stack 对象作为内核主任务的初始栈
     let init_stack_ptr = alloc_stack();
     unsafe { (main_ptr as *mut VschedTaskImpl).as_mut().unwrap() }
@@ -162,6 +169,13 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace_ptr: Option<*m
         if !aspace_ptr.is_null() {
             let aspace = unsafe { &*(aspace_ptr as *const axmm::AddrSpace) };
             let root = aspace.page_table_root();
+            // Copy kernel mappings to user AS BEFORE switching PT,
+            // so kernel code can execute under user PT.
+            {
+                let mut user_aspace = unsafe { &mut *(aspace_ptr as *mut axmm::AddrSpace) };
+                let kernel_aspace = axmm::kernel_aspace().lock();
+                let _ = user_aspace.copy_mappings_from(&kernel_aspace);
+            }
             if root.as_usize() != 0 && root != kernel_root {
                 unsafe {
                     asm::write_user_page_table(root);
@@ -173,7 +187,8 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace_ptr: Option<*m
         axlog::ax_println!("vsched2: calling process_init...");
         let pid = libvsched2::process_init(vspace_ptr);
         axlog::ax_println!("vsched2: process_init pid={}", pid);
-        libvsched2::push_task_into_current(init_task_ptr);
+        let pushed = libvsched2::push_task_into_process(init_task_ptr, pid);
+        axlog::ax_println!("vsched2: push_task_into_process pid={} result={}", pid, pushed);
         unsafe {
             asm::write_user_page_table(kernel_root);
             asm::flush_tlb(None);

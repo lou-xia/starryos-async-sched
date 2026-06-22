@@ -84,9 +84,7 @@ impl libvsched2::Task for VschedTaskImpl {
     }
 
     fn is_kernel(&self) -> bool {
-        // Workaround: user tasks go to KERNEL_SCHEDULER until process scheduler
-        // sources are verified working (init_sources after process_init).
-        true
+        self.pid.load(Ordering::Acquire) == 0
     }
 
     fn pid(&self) -> usize {
@@ -107,20 +105,12 @@ impl libvsched2::Task for VschedTaskImpl {
     }
 
     /// 从 `trap_frame` 恢复寄存器上下文。不返回——直接跳转到保存的指令。
+    /// 仅内核任务调用（用户任务走 `into_user_context`）。
     fn restore_context(&self) {
         let tf_ptr = self.trap_frame.load(Ordering::Acquire);
         assert_ne!(tf_ptr, 0, "restore_context: trap_frame is null");
         let tf = unsafe { &*(tf_ptr as *const UserTrapFrame) };
-        let user_root = self.user_page_table_root.load(Ordering::Acquire);
-        if user_root != 0 {
-            // User task: switch to user PT, then load regs and sret.
-            // into_vspace is no-op, so kernel PT is still active here.
-            crate::vsched::context::activate_user_aspace(memory_addr::PhysAddr::from(user_root));
-            unsafe { tf.restore_and_sret() };
-        } else {
-            // Kernel task (bootstrap main): restore callee-saved and return.
-            unsafe { tf.restore_and_jump() };
-        }
+        unsafe { tf.restore_and_jump() };
     }
 
     fn poll(&self) -> Poll<isize> {

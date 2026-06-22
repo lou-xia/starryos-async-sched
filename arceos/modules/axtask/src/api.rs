@@ -8,6 +8,21 @@ use core::sync::atomic::AtomicUsize;
 
 use kernel_guard::NoPreemptIrqSave;
 
+/// Function pointer for vsched2 yield trampoline.
+/// When set (non-zero), `yield_now()` delegates to vsched2 instead of AxRunQueue.
+static VSCHED2_YIELD: AtomicUsize = AtomicUsize::new(0);
+
+/// Register the vsched2 yield trampoline. After this, all `yield_now()` calls
+/// will enter the vsched2 scheduler instead of the legacy AxRunQueue.
+pub fn register_vsched2_yield(yield_fn: unsafe extern "C" fn() -> !) {
+    VSCHED2_YIELD.store(yield_fn as usize, core::sync::atomic::Ordering::Release);
+}
+
+/// Returns true if vsched2 yield is registered (non-zero).
+pub(crate) fn vsched2_active() -> bool {
+    VSCHED2_YIELD.load(core::sync::atomic::Ordering::Acquire) != 0
+}
+
 pub(crate) use crate::run_queue::{current_run_queue, select_run_queue};
 #[doc(cfg(all(feature = "multitask", feature = "task-ext")))]
 #[cfg(feature = "task-ext")]
@@ -250,7 +265,15 @@ pub fn set_current_affinity(cpumask: AxCpuMask) -> bool {
 
 /// Current task gives up the CPU time voluntarily, and switches to another
 /// ready task.
+///
+/// If vsched2 yield is registered (non-zero), delegates to vsched2's yield
+/// trampoline instead of the legacy AxRunQueue.
 pub fn yield_now() {
+    let f = VSCHED2_YIELD.load(core::sync::atomic::Ordering::Acquire);
+    if f != 0 {
+        let f: unsafe extern "C" fn() -> ! = unsafe { core::mem::transmute(f) };
+        unsafe { f() };
+    }
     current_run_queue::<NoPreemptIrqSave>().yield_current()
 }
 

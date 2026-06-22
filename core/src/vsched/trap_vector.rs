@@ -12,11 +12,9 @@ vsched2_trap_vector:
     la      t2, {trap_scratch_ptr}
     sd      t0, 0(t2)
 
-    // Step 1: load kernel SATP and switch
-    ld      t0, {kernel_satp_ptr}  // load KERNEL_SATP_VAL (kernel data, user PT accessible)
-    csrw    satp, t0
-    sfence.vma zero, zero
-    // Kernel PT is now active
+    // StarryOS design: kernel pages are mapped in all user page tables.
+    // LinearBackend::map creates PTEs immediately, so all kernel data
+    // (pre-save stack, text, globals) are accessible without SATP switch.
 
     // Step 2: swap stack
     csrrw   sp, sscratch, sp
@@ -105,7 +103,6 @@ vsched2_trap_vector:
     j       .
 
 "#,
-    kernel_satp_ptr = sym crate::vsched::KERNEL_SATP_VAL,
     kernel_gp_ptr = sym crate::vsched::KERNEL_GP,
     trap_scratch_ptr = sym crate::vsched::TRAP_SCRATCH,
 );

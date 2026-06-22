@@ -14,6 +14,15 @@ use kspin::SpinNoIrq;
 
 use crate::{AxTaskRef, WeakAxTaskRef, current, current_run_queue, select_run_queue};
 
+/// Minimal Waker for vsched2 block_on — the wake signal is ignored in the
+/// yield-based vsched2 path because the vsched2 scheduler will re-poll
+/// the blocked task when it is next scheduled.
+struct VschedWaker;
+
+impl Wake for VschedWaker {
+    fn wake(self: Arc<Self>) {}
+}
+
 mod poll;
 pub use poll::*;
 
@@ -52,7 +61,25 @@ impl Wake for AxWaker {
 /// Note that this doesn't handle interruption and is not recommended for direct
 /// use in most cases.
 pub fn block_on<F: IntoFuture>(f: F) -> F::Output {
+    if crate::api::vsched2_active() {
+        // vsched2 active: use poll + yield loop (each yield goes to vsched2).
+        // Wake events from unblock_task go through the legacy AxRunQueue,
+        // but we poll on each reschedule, so blocked tasks naturally progress.
+        let mut fut = pin!(f.into_future());
+        let waker = Waker::from(Arc::new(VschedWaker));
+        let mut cx = Context::from_waker(&waker);
+        loop {
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Pending => {
+                    crate::yield_now();
+                }
+                Poll::Ready(output) => return output,
+            }
+        }
+    }
+
     let mut fut = pin!(f.into_future());
+    // ... rest of original block_on ...
 
     let curr = current();
     // It's necessary to keep a strong reference to the current task

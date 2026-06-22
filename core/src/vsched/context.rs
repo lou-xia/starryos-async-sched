@@ -3,7 +3,6 @@
 use axmm::AddrSpace;
 use memory_addr::PhysAddr;
 use axhal::mem::phys_to_virt;
-use axlog::ax_println;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use super::trapframe::UserTrapFrame;
 use super::task::VschedTaskImpl;
@@ -129,21 +128,20 @@ impl libvsched2::Context for VschedContextImpl {
     }
 
     fn into_user_context(task: *const ()) {
-        axlog::ax_println!("[into_user_context] task={:?}", task);
         let vsched_task = unsafe { &*(task as *const VschedTaskImpl) };
         let tf_ptr = vsched_task.trap_frame.load(Ordering::Acquire);
         assert_ne!(tf_ptr, 0, "into_user_context: trap_frame is null");
         let tf = unsafe { &*(tf_ptr as *const UserTrapFrame) };
-        axlog::ax_println!("[into_user_context] sepc={:#x} sp={:#x} sstatus={:#x}",
-            tf.sepc, tf.regs.sp, tf.sstatus);
-        // User PT already active from into_vspace. Just load regs and sret.
+        // into_vspace already switched SATP to user PT. Load regs and sret.
         unsafe { tf.restore_and_sret() };
     }
 }
 
 impl libvsched2::VSpace for VschedVSpaceImpl {
-    fn into_vspace(_vspace: *mut ()) {
-        // No-op: keep kernel PT during scheduling.
-        // PT switch happens in restore_context / into_user_context before sret.
+    /// 切换到指定地址空间（写 SATP + 刷新 TLB + SUM）。
+    fn into_vspace(vspace: *mut ()) {
+        if let Some(root) = page_table_root_from_raw(vspace) {
+            activate_user_aspace(root);
+        }
     }
 }
