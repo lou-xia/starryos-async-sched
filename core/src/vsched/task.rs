@@ -4,8 +4,6 @@ use alloc::{boxed::Box, sync::Arc};
 use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use core::task::Poll;
 
-use axlog::ax_println;
-use axmm;
 use axtask::{AxTaskRef, TaskState as AxTaskState};
 use memory_addr;
 
@@ -34,8 +32,8 @@ pub struct VschedTaskImpl {
     pub trap_frame: AtomicUsize,
     /// 用户态页表根物理地址（仅用户任务设置），`into_user_context` 时切换到该页表。
     pub user_page_table_root: AtomicUsize,
-    /// 用户地址空间，用于在 sret 前将最新内核映射复制到用户页表。
-    pub user_aspace: AtomicUsize,
+    /// 用户 AddrSpace 裸指针(Arc<Mutex<AddrSpace>>), 用于 copy_mappings_from
+    pub user_aspace_ptr: AtomicUsize,
 }
 
 impl VschedTaskImpl {
@@ -56,7 +54,7 @@ impl VschedTaskImpl {
             coroutine,
             trap_frame: AtomicUsize::new(0),
             user_page_table_root: AtomicUsize::new(0),
-            user_aspace: AtomicUsize::new(0),
+            user_aspace_ptr: AtomicUsize::new(0),
             user_vdso_base: AtomicUsize::new(0),
         }
     }
@@ -86,7 +84,9 @@ impl libvsched2::Task for VschedTaskImpl {
     }
 
     fn is_kernel(&self) -> bool {
-        self.pid.load(Ordering::Acquire) == 0
+        // Workaround: user tasks go to KERNEL_SCHEDULER until process scheduler
+        // sources are verified working (init_sources after process_init).
+        true
     }
 
     fn pid(&self) -> usize {
@@ -109,20 +109,16 @@ impl libvsched2::Task for VschedTaskImpl {
     /// 从 `trap_frame` 恢复寄存器上下文。不返回——直接跳转到保存的指令。
     fn restore_context(&self) {
         let tf_ptr = self.trap_frame.load(Ordering::Acquire);
-        assert_ne!(
-            tf_ptr, 0,
-            "restore_context: trap_frame is null — thread tasks must have an initial trap frame set before first scheduling"
-        );
+        assert_ne!(tf_ptr, 0, "restore_context: trap_frame is null");
         let tf = unsafe { &*(tf_ptr as *const UserTrapFrame) };
-        // 用户任务需要 sret 切至用户态 + 切换用户页表；
-        // 内核任务用 jr（不改变特权级）。
         let user_root = self.user_page_table_root.load(Ordering::Acquire);
         if user_root != 0 {
-            axlog::ax_println!("[restore] pid={} user_root={:#x} sepc={:#x} sp={:#x}",
-                self.task.id_name(), user_root, tf.sepc, tf.regs.sp);
-            let satp_val = (8usize << 60) | (user_root >> 12);
-            unsafe { tf.restore_and_sret_user(satp_val) };
+            // User task: switch to user PT, then load regs and sret.
+            // into_vspace is no-op, so kernel PT is still active here.
+            crate::vsched::context::activate_user_aspace(memory_addr::PhysAddr::from(user_root));
+            unsafe { tf.restore_and_sret() };
         } else {
+            // Kernel task (bootstrap main): restore callee-saved and return.
             unsafe { tf.restore_and_jump() };
         }
     }

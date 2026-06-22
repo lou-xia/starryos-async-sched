@@ -5,7 +5,7 @@ use core::{
 
 use axerrno::{AxError, AxResult};
 use axhal::uspace::{ExceptionKind, ReturnReason, UserContext};
-use axtask::{TaskInner, current, spawn_task};
+use axtask::{AxTaskRef, TaskInner, current, spawn_task};
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::general::ROBUST_LIST_LIMIT;
 use ringbuf::Arc;
@@ -211,23 +211,24 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
     thr.set_exit();
 }
 
-/// Sends a fatal signal to the current process.
-pub fn raise_signal_fatal(sig: SignalInfo) -> AxResult<()> {
-    let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-
+/// Sends a fatal signal to the given task's process.
+pub fn raise_signal_fatal_for_task(task: &AxTaskRef, sig: SignalInfo) -> AxResult<()> {
+    let proc_data = &task.as_thread().proc_data;
     let signo = sig.signo();
     info!("Send fatal signal {signo:?} to the current process");
     if let Some(tid) = proc_data.signal.send_signal(sig)
-        && let Ok(task) = get_task(tid)
+        && let Ok(t) = get_task(tid)
     {
-        task.interrupt();
+        t.interrupt();
     } else {
-        // No task wants to handle the signal, abort the task
         do_exit(signo as i32, true);
     }
-
     Ok(())
+}
+
+/// Sends a fatal signal to the current process.
+pub fn raise_signal_fatal(sig: SignalInfo) -> AxResult<()> {
+    raise_signal_fatal_for_task(&current(), sig)
 }
 
 fn syscall_task(mut uctx: UserContext, finish: Arc<AtomicBool>) {
@@ -257,27 +258,37 @@ fn vsched_trap_dispatcher(trapped_task: *const VschedTaskImpl) {
     let vti = unsafe { &*trapped_task };
     let tf_ptr = vti.trap_frame.load(Ordering::Acquire);
     if tf_ptr == 0 {
-        axlog::ax_println!("[trap] task={} trap_frame=null", vti.task.id_name());
         return;
     }
     let tf = unsafe { &*(tf_ptr as *const UserTrapFrame) };
-    axlog::ax_println!("[trap] task={} scause={} sepc={:#x} stval={:#x}", vti.task.id_name(), tf.scause, tf.sepc, tf.stval);
+
+    // Use the TRAPPED task for signals, not current() (which is trap handler)
+    let mut signal_task = vti.task.clone();
+    // If trapped task is a kernel coroutine (handler), use last user task for signals
+    if !vti.task.try_as_thread().is_some() {
+        let last_user = starry_core::vsched::trap::get_last_trapped_user_task();
+        if !last_user.is_null() {
+            signal_task = unsafe { &*last_user }.task.clone();
+        }
+    }
+
+    // For page faults during syscall handling, the trapped task is the handler.
+    // Store the actual user task being serviced to use for page fault resolution.
+    static LAST_ECALL_USER_TASK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
     match tf.scause {
-        12 | 13 | 15 => {
-            let vaddr = VirtAddr::from(tf.stval);
-            let flags = match tf.scause {
-                12 => MappingFlags::EXECUTE | MappingFlags::USER,
-                13 => MappingFlags::READ | MappingFlags::USER,
-                _ => MappingFlags::WRITE | MappingFlags::USER,
-            };
-            if let Some(thr) = vti.task.try_as_thread() {
-                if !thr.proc_data.aspace.lock().handle_page_fault(vaddr, flags) {
-                    raise_signal_fatal(SignalInfo::new_kernel(Signo::SIGSEGV)).ok();
-                }
-            }
+        // Timer interrupt: handled by stub (stimecmp reset), just ignore here
+        sc if sc >> 63 == 1 => {
+            static TIMER_CNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+            let n = TIMER_CNT.fetch_add(1, Ordering::Relaxed);
+            if n < 5 { axlog::ax_println!("[stats] timer={}", n+1); }
         }
-        8 => {
+          8 => {
+            static ECALL_CNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+            let n = ECALL_CNT.fetch_add(1, Ordering::Relaxed);
+            if n < 50 { axlog::ax_println!("[stats] ecall#{} a7={}", n, tf.regs.a7); }
+            axlog::ax_println!("[ecall] a7={} a0={:#x} a1={:#x} a2={} sepc={:#x} sp={:#x}",
+                tf.regs.a7, tf.regs.a0, tf.regs.a1, tf.regs.a2, tf.sepc, tf.regs.sp);
             let mut uctx = UserContext::new(
                 tf.sepc + 4,
                 VirtAddr::from(tf.regs.sp),
@@ -292,14 +303,116 @@ fn vsched_trap_dispatcher(trapped_task: *const VschedTaskImpl) {
             uctx.set_ra(tf.regs.ra);
             uctx.set_tls(tf.regs.tp);
 
+            // Store user task for page fault fallback
+            LAST_ECALL_USER_TASK.store(trapped_task as usize, Ordering::Release);
+
             axtask::with_current_task(&vti.task, || {
                 handle_syscall(&mut uctx);
             });
 
             let tf_mut = unsafe { &mut *(tf_ptr as *mut UserTrapFrame) };
-            tf_mut.regs = unsafe { core::mem::transmute_copy(&uctx.regs) };
+            // Only update caller-saved registers that syscall may change.
+            // Keep callee-saved regs (s0-s11) from the original trap frame.
+            tf_mut.regs.a0 = uctx.arg0();  // return value
+            tf_mut.regs.a1 = uctx.arg1();  // may be modified (pipe, etc.)
+            // a2-a5: keep original (not usually modified by kernel)
+            // a6-a7: keep original
             tf_mut.sepc = uctx.ip();
             tf_mut.sstatus = uctx.sstatus.bits();
+            axlog::ax_println!("[ecall] ret a0={} new_sepc={:#x}", tf_mut.regs.a0, tf_mut.sepc);
+        }
+         12 | 13 | 15 => {
+            static PF_CNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+            let n = PF_CNT.fetch_add(1, Ordering::Relaxed);
+            let log_detail = n < 3;
+            if log_detail { axlog::ax_println!("[pf] ENTER vaddr={:#x} scause={}", tf.stval, tf.scause); }
+            let vaddr = VirtAddr::from(tf.stval);
+            let flags = match tf.scause {
+                12 => MappingFlags::EXECUTE | MappingFlags::USER,
+        13 => MappingFlags::READ | MappingFlags::USER,
+        _ => MappingFlags::WRITE | MappingFlags::USER,
+            };
+            // Try trapped task first, then fall back to axtask::current()
+            let fixed = {
+                if log_detail { axlog::ax_println!("[pf] try_as_thread: vti={}", vti.task.try_as_thread().is_some()); }
+                if let Some(thr) = vti.task.try_as_thread() {
+                    let mut aspace = thr.proc_data.aspace.lock();
+                    let pt_result = aspace.page_table().query(vaddr);
+                    if log_detail { axlog::ax_println!("[pf] vaddr={:#x} PT query={:?}", vaddr.as_usize(), pt_result); }
+                    if log_detail {
+                        axlog::ax_println!("[pf] all areas:");
+                        for area in aspace.areas() {
+                            axlog::ax_println!("[pf] AREA {:#x}-{:#x}", area.start().as_usize(), area.end().as_usize());
+                        }
+                    }
+                    aspace.handle_page_fault(vaddr, flags)
+                } else {
+                    let cur = axtask::current();
+                    axlog::ax_println!("[pf] fallback: axcur has_thread={}", cur.try_as_thread().is_some());
+                    if let Some(thr) = cur.try_as_thread() {
+                        let mut aspace = thr.proc_data.aspace.lock();
+                        aspace.handle_page_fault(vaddr, flags)
+                    } else {
+                        let last_user = starry_core::vsched::trap::get_last_trapped_user_task();
+                        if !last_user.is_null() {
+                            let last_vti = unsafe { &*last_user };
+                            if let Some(thr) = last_vti.task.try_as_thread() {
+                                let mut aspace = thr.proc_data.aspace.lock();
+                                // Check if page is already mapped before handle_page_fault
+                                if aspace.page_table().query(vaddr).is_ok() {
+                                    true
+                                } else {
+                                    let hpf = aspace.handle_page_fault(vaddr, flags);
+                                    hpf
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    }
+                }
+            };
+            axlog::ax_println!("[pf] vaddr={:#x} fixed={} scause={}", tf.stval, fixed, tf.scause);
+            if !fixed {
+                raise_signal_fatal_for_task(&signal_task, SignalInfo::new_kernel(Signo::SIGSEGV)).ok();
+            }
+        }
+         8 => {
+            axlog::ax_println!("[ecall] a7={} a0={} a1={:#x} a2={} sepc={:#x} sp={:#x}",
+                tf.regs.a7, tf.regs.a0, tf.regs.a1, tf.regs.a2, tf.sepc, tf.regs.sp);
+            let mut uctx = UserContext::new(
+                tf.sepc + 4,
+                VirtAddr::from(tf.regs.sp),
+                tf.regs.a0,
+            );
+            uctx.set_arg1(tf.regs.a1);
+            uctx.set_arg2(tf.regs.a2);
+            uctx.set_arg3(tf.regs.a3);
+            uctx.set_arg4(tf.regs.a4);
+            uctx.set_arg5(tf.regs.a5);
+            uctx.set_sysno(tf.regs.a7);
+            uctx.set_ra(tf.regs.ra);
+            uctx.set_tls(tf.regs.tp);
+
+            // Store user task for page fault fallback
+            LAST_ECALL_USER_TASK.store(trapped_task as usize, Ordering::Release);
+
+            axtask::with_current_task(&vti.task, || {
+                handle_syscall(&mut uctx);
+            });
+
+            let tf_mut = unsafe { &mut *(tf_ptr as *mut UserTrapFrame) };
+            // Only update caller-saved registers that syscall may change.
+            // Keep callee-saved regs (s0-s11) from the original trap frame.
+            tf_mut.regs.a0 = uctx.arg0();  // return value
+            tf_mut.regs.a1 = uctx.arg1();  // may be modified (pipe, etc.)
+            // a2-a5: keep original (not usually modified by kernel)
+            // a6-a7: keep original
+            tf_mut.sepc = uctx.ip();
+            tf_mut.sstatus = uctx.sstatus.bits();
+            axlog::ax_println!("[ecall] ret a0={} new_sepc={:#x}", tf_mut.regs.a0, tf_mut.sepc);
         }
         1 | 5 | 7 => {
             axlog::error!(
@@ -308,27 +421,27 @@ fn vsched_trap_dispatcher(trapped_task: *const VschedTaskImpl) {
                 tf.stval,
                 vti.task.id_name(),
             );
-            raise_signal_fatal(SignalInfo::new_kernel(Signo::SIGSEGV)).ok();
+            raise_signal_fatal_for_task(&signal_task, SignalInfo::new_kernel(Signo::SIGSEGV)).ok();
         }
-        2 => {
+         2 => {
             axlog::error!(
                 "vsched trap: illegal instruction @ {:#x}, task={}",
                 tf.sepc,
                 vti.task.id_name(),
             );
-            raise_signal_fatal(SignalInfo::new_kernel(Signo::SIGILL)).ok();
+            raise_signal_fatal_for_task(&signal_task, SignalInfo::new_kernel(Signo::SIGILL)).ok();
         }
-        3 => {
-            raise_signal_fatal(SignalInfo::new_kernel(Signo::SIGTRAP)).ok();
+         3 => {
+            raise_signal_fatal_for_task(&signal_task, SignalInfo::new_kernel(Signo::SIGTRAP)).ok();
         }
-        0 | 4 | 6 => {
+         0 | 4 | 6 => {
             axlog::error!(
                 "vsched trap: misaligned access scause={}, vaddr={:#x}, task={}",
                 tf.scause,
                 tf.stval,
                 vti.task.id_name(),
             );
-            raise_signal_fatal(SignalInfo::new_kernel(Signo::SIGBUS)).ok();
+            raise_signal_fatal_for_task(&signal_task, SignalInfo::new_kernel(Signo::SIGBUS)).ok();
         }
         _ => {
             axlog::warn!(
@@ -338,7 +451,7 @@ fn vsched_trap_dispatcher(trapped_task: *const VschedTaskImpl) {
                 tf.sepc,
                 vti.task.id_name(),
             );
-            raise_signal_fatal(SignalInfo::new_kernel(Signo::SIGTRAP)).ok();
+            raise_signal_fatal_for_task(&signal_task, SignalInfo::new_kernel(Signo::SIGTRAP)).ok();
         }
     }
 }

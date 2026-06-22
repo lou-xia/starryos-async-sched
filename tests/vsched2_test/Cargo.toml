@@ -3,8 +3,4 @@ name = "vsched2_test"
 version = "0.1.0"
 edition = "2024"
 
-# dp：依赖 build_vdso 生成的 libvsched2 包装库。
-# dp：libvsched2 提供了 vsched2 的所有 vDSO API 函数的包装器，
-# dp：以及 init_vdso_vtable 用于初始化用户侧虚表。
 [dependencies]
-libvsched2 = { path = "../../vdso_vsched2_output/libvsched2" }

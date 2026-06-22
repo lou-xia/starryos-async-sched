@@ -50,6 +50,7 @@ fn create_vsched_init_task(args: &[String], envs: &[String]) -> (*const starry_c
 
     let (entry_vaddr, ustack_top) = load_user_app(&mut uspace, None, args, envs)
         .unwrap_or_else(|e| panic!("Failed to load user app: {}", e));
+    axlog::ax_println!("create_vsched_init_task: entry={:#x}, ustack_top={:#x}", entry_vaddr.as_usize(), ustack_top.as_usize());
 
     let uctx = UserContext::new(entry_vaddr.into(), ustack_top, 0);
 
@@ -77,11 +78,8 @@ fn create_vsched_init_task(args: &[String], envs: &[String]) -> (*const starry_c
     };
     // 保存用户页表根，稍后存入 VschedTaskImpl
     let user_root = proc_data.aspace.lock().page_table_root();
-    {
-        let mut scope = proc_data.scope.write();
-        starry_api::file::add_stdio(&mut FD_TABLE.scope_mut(&mut scope).write())
-            .expect("Failed to add stdio");
-    }
+    // 保存 Mutex 裸指针用于后续 copy_mappings_from
+    let aspace_mutex_ptr = Arc::as_ptr(&proc_data.aspace) as usize;
     let thr = Thread::new(pid, proc_data);
     *task.task_ext_mut() = Some(unsafe { AxTaskExt::from_impl(thr) });
 
@@ -90,6 +88,15 @@ fn create_vsched_init_task(args: &[String], envs: &[String]) -> (*const starry_c
 
     let task_ref = axtask::into_ref(task);
     add_task_to_table(&task_ref);
+
+    // Add stdio while user task is current
+    use starry_core::task::AsThread;
+    axtask::with_current_task(&task_ref, || {
+        let thr = task_ref.try_as_thread().expect("user task should have thread");
+        let mut scope = thr.proc_data.scope.write();
+        starry_api::file::add_stdio(&mut FD_TABLE.scope_mut(&mut scope).write())
+            .expect("Failed to add stdio");
+    });
 
     let mut tf = Box::new(UserTrapFrame {
         regs: unsafe { core::mem::zeroed() },
@@ -111,6 +118,7 @@ fn create_vsched_init_task(args: &[String], envs: &[String]) -> (*const starry_c
     unsafe { &*vti }.thread_stack_ptr.store(init_stack_ptr as usize, Ordering::Release);
     unsafe { &*vti }.trap_frame.store(tf_ptr as usize, Ordering::Release);
     unsafe { &*vti }.user_page_table_root.store(user_root.as_usize(), Ordering::Release);
+    unsafe { &*vti }.user_aspace_ptr.store(aspace_mutex_ptr, Ordering::Release);
     (vti, vspace_ptr)
 }
 
@@ -125,6 +133,7 @@ fn main() {
         .map(str::to_owned)
         .collect::<Vec<_>>();
     let envs = [];
+    axlog::ax_println!("main: args={:?}", args);
     let (init_ptr, vspace_ptr) = create_vsched_init_task(&args, &envs);
 
     starry_core::vsched::vsched2_bootstrap(Some(init_ptr as *const ()), Some(vspace_ptr));

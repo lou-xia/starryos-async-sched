@@ -123,20 +123,17 @@ impl UserTrapFrame {
         }
     }
 
-    /// 恢复全部寄存器并切到用户页表后 sret 到用户态。
-    /// `satp_root` 是用户页表的物理根地址。
-    pub unsafe fn restore_and_sret_user(&self, satp_root: usize) -> ! {
+    /// 恢复全部寄存器，切换用户页表，并 sret 到用户态。
+    /// 先在内核页表下恢复全部寄存器，然后切换 SATP，最后 sret。
+    pub unsafe fn restore_and_sret_user(&self) -> ! {
         unsafe {
             core::arch::asm!(
                 "mv     sp, {tf}",
-                "ld     t0, 256(sp)",       // sepc
-                "ld     t1, 264(sp)",       // sstatus
+                "ld     t0, 256(sp)",       // sepc → t0
+                "ld     t1, 264(sp)",       // sstatus → t1
                 "csrw   sepc, t0",
                 "csrw   sstatus, t1",
-                // 写入用户页表根（sfence.vma 仅在改变页表后需要）
-                "csrw   satp, {satp}",
-                "sfence.vma",
-                // 全量恢复 32 GPR
+                // 全量恢复 32 GPR（内核页表）
                 "ld     ra, 8(sp)",
                 "ld     gp, 24(sp)",
                 "ld     tp, 32(sp)",
@@ -168,6 +165,64 @@ impl UserTrapFrame {
                 "ld     t5, 240(sp)",
                 "ld     t6, 248(sp)",
                 "ld     sp, 16(sp)",
+                "sret",
+                tf = in(reg) self,
+                options(noreturn),
+            )
+        }
+    }
+
+    /// 恢复全部寄存器并切到用户页表后 sret 到用户态。
+    /// `satp_root` 已使用 satp::set 正确编码。
+    #[deprecated = "use restore_and_sret_user + activate_user_aspace"]
+    pub unsafe fn restore_and_sret_user_with_satp(&self, satp_root: usize) -> ! {
+        unsafe {
+            core::arch::asm!(
+                "mv     sp, {tf}",
+                // 加载 sepc/sstatus 并立即写入 CSR（值保持到 sret）
+                "ld     t0, 256(sp)",       // sepc → t0
+                "ld     t1, 264(sp)",       // sstatus → t1
+                "csrw   sepc, t0",          // 写入 CSR, 不再需要 t0/t1
+                "csrw   sstatus, t1",
+                // 全量恢复 32 GPR（全部用内核页表，t0/t1 被覆盖但 CSR 已写）
+                "ld     ra, 8(sp)",
+                "ld     gp, 24(sp)",
+                "ld     tp, 32(sp)",
+                "ld     t0, 40(sp)",
+                   "ld     t1, 48(sp)",
+                "ld     t2, 56(sp)",
+                "ld     s0, 64(sp)",
+                "ld     s1, 72(sp)",
+                "ld     a0, 80(sp)",
+                "ld     a1, 88(sp)",
+                "ld     a2, 96(sp)",
+                "ld     a3, 104(sp)",
+                "ld     a4, 112(sp)",
+                "ld     a5, 120(sp)",
+                "ld     a6, 128(sp)",
+                "ld     a7, 136(sp)",
+                "ld     s2, 144(sp)",
+                "ld     s3, 152(sp)",
+                "ld     s4, 160(sp)",
+                "ld     s5, 168(sp)",
+                "ld     s6, 176(sp)",
+                "ld     s7, 184(sp)",
+                "ld     s8, 192(sp)",
+                "ld     s9, 200(sp)",
+                "ld     s10, 208(sp)",
+                "ld     s11, 216(sp)",
+                "ld     t3, 224(sp)",
+                "ld     t4, 232(sp)",
+                "ld     t5, 240(sp)",
+                "ld     t6, 248(sp)",
+                // 最后恢复用户 sp
+                "ld     sp, 16(sp)",
+                // 切换用户页表（仅影响 sret 之后）
+                "csrw   satp, {satp}",
+                "sfence.vma",
+                "li     t3, 0xffffffc010000000",
+                "li     t4, 82",
+                "sb     t4, 0(t3)",
                 "sret",
                 tf = in(reg) self,
                 satp = in(reg) satp_root,

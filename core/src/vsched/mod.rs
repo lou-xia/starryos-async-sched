@@ -32,6 +32,19 @@ pub static mut VSCHED2_VDSO_SIZE: usize = 0;
 
 static VSCHED2_READY: AtomicBool = AtomicBool::new(false);
 
+/// 内核 SATP 值，在 activate_vsched_trap_vector 时写入, trap 向量直接加载
+pub static KERNEL_SATP_VAL: AtomicUsize = AtomicUsize::new(0);
+/// trap 向量暂存用户 t0
+pub static TRAP_SCRATCH: AtomicUsize = AtomicUsize::new(0);
+/// 内核 gp 值, activate_vsched_trap_vector 时记录, trap 向量恢复 (per-CPU access)
+pub static KERNEL_GP: AtomicUsize = AtomicUsize::new(0);
+/// 最近一次进入用户态前保存的任务指针
+pub static LAST_USER_TASK: AtomicUsize = AtomicUsize::new(0);
+/// 当前活跃用户页表根, 用于陷阱向量进入 VDSO 前切换页表
+pub static LAST_USER_PT_ROOT: AtomicUsize = AtomicUsize::new(0);
+pub static KERNEL_VVAR_BASE: AtomicUsize = AtomicUsize::new(0);
+pub static KERNEL_KSCHEDULER: AtomicUsize = AtomicUsize::new(0);
+
 pub const HIGHEST_PRIORITY: isize = 0;
 pub const LOWEST_PRIORITY: isize = 15;
 
@@ -73,6 +86,8 @@ pub fn init_vsched2_interfaces() {
     libvsched2::init_vtable_SMP::<smp::VschedSmpImpl>();
     libvsched2::init_vtable_VSpace::<context::VschedVSpaceImpl>();
     libvsched2::init_vtable_UserData::<userdata::VschedUserDataImpl>();
+
+    // Dump VDSO_VTABLE to verify no BSS entries
 }
 
 unsafe extern "C" {
@@ -80,24 +95,40 @@ unsafe extern "C" {
 }
 
 pub fn activate_vsched_trap_vector() {
-    // 必须先在 V_KSATP 中保存内核页表根，再替换 stvec，
-    // 否则替换后即刻发生的异常会读到 V_KSATP=0。
-    let ks = unsafe { asm::read_user_page_table() };
-    let satp_val = (8usize << 60) | (ks.as_usize() >> 12);
-    trap_vector::set_kernel_satp(satp_val);
-
-    let init_stack = unsafe {
-        alloc(Layout::from_size_align(config::KERNEL_STACK_SIZE, 16).unwrap())
-    };
-    assert!(!init_stack.is_null(), "failed to allocate initial sscratch stack");
+    // Layout: [pre-save stack 256KB][kernel SATP 8B]
+    let layout = alloc::alloc::Layout::from_size_align(262144 + 8, 16).unwrap();
+    let raw: *mut u8 = unsafe { alloc::alloc::alloc(layout) };
+    assert!(!raw.is_null(), "failed to alloc pre-save stack");
+    let stack_top = raw as usize + 262144;
+    let kernel_satp: usize;
     unsafe {
-        core::arch::asm!("csrw sscratch, {}", in(reg) init_stack);
+        core::arch::asm!("csrr {}, satp", out(reg) kernel_satp);
+        let slot = stack_top as *mut usize;
+        slot.write_volatile(kernel_satp);
+    }
+    KERNEL_SATP_VAL.store(kernel_satp, Ordering::Release);
+    let kernel_gp: usize;
+    unsafe { core::arch::asm!("mv {}, gp", out(reg) kernel_gp) };
+    KERNEL_GP.store(kernel_gp, Ordering::Release);
+    unsafe {
+        let stvec_val: usize;
+        let sie_val: usize;
+        let sstatus_val: usize;
+        core::arch::asm!(
+            "csrr {}, stvec",
+            "csrr {}, sie",
+            "csrr {}, sstatus",
+            out(reg) stvec_val, out(reg) sie_val, out(reg) sstatus_val,
+        );
+        axlog::ax_println!("vsched2: stvec={:#x} sie={:#x} sstatus={:#x}",
+            stvec_val, sie_val, sstatus_val);
+        core::arch::asm!("csrw sscratch, {}", in(reg) stack_top);
         axhal::asm::write_trap_vector_base(vsched2_trap_vector as *const () as usize);
     }
 }
 
 pub fn push_task_to_kernel(task_ptr: *const ()) {
-    libvsched2::push_task_into_current(task_ptr, 0);
+    libvsched2::push_task_into_current(task_ptr);
 }
 
 /// 分配一个用于 vsched2 的 Stack 对象
@@ -142,7 +173,7 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace_ptr: Option<*m
         axlog::ax_println!("vsched2: calling process_init...");
         let pid = libvsched2::process_init(vspace_ptr);
         axlog::ax_println!("vsched2: process_init pid={}", pid);
-        libvsched2::push_task_into_current(init_task_ptr, 0);
+        libvsched2::push_task_into_current(init_task_ptr);
         unsafe {
             asm::write_user_page_table(kernel_root);
             asm::flush_tlb(None);
@@ -162,8 +193,10 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace_ptr: Option<*m
         }
     }
 
-    unsafe {
-        core::arch::asm!("call vsched_yield_trampoline", options(noreturn));
+    axlog::ax_println!("vsched2: entering yield loop");
+    loop {
+        unsafe {
+            core::arch::asm!("call vsched_yield_trampoline");
+        }
     }
-    unreachable!()
 }

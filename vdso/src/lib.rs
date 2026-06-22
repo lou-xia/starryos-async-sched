@@ -2,9 +2,10 @@
 
 use axalloc::{UsageKind, global_allocator};
 use axhal::mem::{phys_to_virt, virt_to_phys};
+use axhal::paging::MappingFlags;
 use axlog::ax_println;
 use axmm::{AddrSpace, kernel_aspace};
-use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr, VirtAddrRange, align_up_4k};
+use memory_addr::{MemoryAddr, PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange, align_up_4k};
 pub use libvsched2::*;
 
 pub static mut VDSO_START_PA: usize = 0;
@@ -116,6 +117,13 @@ pub fn vdso_init() {
         VDSO_START_PA = usize::from(virt_to_phys(VirtAddr::from(vdso_start as usize)));
         VDSO_SIZE = VDSO_RESERVED_SIZE;
     };
+    let vvar_kernel_expected =
+        phys_to_virt(PhysAddr::from(unsafe { VDSO_START_PA })).as_usize() - unsafe { VVAR_SIZE };
+    let vvar_kernel_actual =
+        phys_to_virt(PhysAddr::from(unsafe { VVAR_START_PA })).as_usize();
+    ax_println!("vdso: vvar expected_kva={:#x} actual_kva={:#x} match={}",
+        vvar_kernel_expected, vvar_kernel_actual,
+        vvar_kernel_expected == vvar_kernel_actual);
     ax_println!(
         "VDSO and vVAR initialized:\n  VVAR at 0x{:016x} (size: {:#x})\n  VDSO at 0x{:016x} (size: {:#x})",
         unsafe { VVAR_START_PA },
@@ -124,3 +132,5 @@ pub fn vdso_init() {
         unsafe { VDSO_SIZE }
     );
 }
+
+// raw_trap_entry: 24c6; trap_entry: 4310

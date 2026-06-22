@@ -8,43 +8,41 @@ global_asm!(
 .globl vsched2_trap_vector
 .align 4
 vsched2_trap_vector:
-    // 强制切回内核页表：sar/sret 之后可能在用户页表中，
-    // 所有内核数据结构（sscratch pre-save stack、分配器、vVAR 等）
-    // 必须通过内核页表访问。
-    la      t0, V_KSATP
-    ld      t0, 0(t0)
+    // Step 0: save user t0 before clobbering (TRAP_SCRATCH)
+    la      t2, {trap_scratch_ptr}
+    sd      t0, 0(t2)
+
+    // Step 1: load kernel SATP and switch
+    ld      t0, {kernel_satp_ptr}  // load KERNEL_SATP_VAL (kernel data, user PT accessible)
     csrw    satp, t0
-    sfence.vma
+    sfence.vma zero, zero
+    // Kernel PT is now active
 
-    // Debug: write 'V' to confirm trap entry
-    li      t0, 0xffffffc010000000
-    li      t1, 0x56
-    sb      t1, 0(t0)
-
-    // Step 1: swap sp ↔ sscratch. sscratch is always pre-set with a valid
-    // pre-save stack (both user and kernel traps follow the same path).
-    // sp ← old sscratch (pre-save stack), sscratch ← old sp
+    // Step 2: swap stack
     csrrw   sp, sscratch, sp
 
-    // Save scratch regs before they are clobbered by SUM and ecall check.
-    sd      t0, 40(sp)        // tf.regs.t0
-    sd      t1, 48(sp)        // tf.regs.t1
-    sd      t2, 56(sp)        // tf.regs.t2
+    // Step 3: restore user t0 and save scratch registers
+    la      t2, {trap_scratch_ptr}
+    ld      t0, 0(t2)              // t0 = user original t0
+    sd      t0, 40(sp)             // save original t0 to tf.regs.t0
+    sd      t1, 48(sp)             // save original t1
+    sd      t2, 56(sp)             // save original t2
 
-    // Pre-save stack re-allocation is NOT done here — vsched2's trap_entry
-    // calls set_pre_stack! for the next trap on every entry.
-    // Set SUM (1<<18) via t1 register — csrs immediate is limited to 5 bits
+    // Step 4: save user sp, restore sscratch
+    csrr    t0, sscratch
+    sd      t0, 16(sp)
+    csrw    sscratch, sp
+
+    // Step 4: set SUM
     li      t1, 0x40000
     csrs    sstatus, t1
 
-    // Step 3: detect vsched2 into_kernel ecall (scause=8, a7=0xdead)
-    // This path skips context save and goes directly to raw_trap_entry.
+    // Detect vsched2 into_kernel ecall
     csrr    t0, scause
     li      t1, 8
     bne     t0, t1, .Lsave_context
     li      t1, 0xdead
     bne     a7, t1, .Lsave_context
-    // Special ecall: set trap_type=2, privilege=inverted SPP
     li      a0, 2
     csrr    t0, sstatus
     srli    a1, t0, 8
@@ -54,84 +52,63 @@ vsched2_trap_vector:
     j       .
 
 .Lsave_context:
-    // Step 4: save full trap context into UserTrapFrame at sp.
-    // t0, t1, t2 already saved above before they were clobbered.
     csrr    t0, sepc
     csrr    t1, sstatus
     csrr    t2, scause
-    sd      t0, 256(sp)       // tf.sepc
-    sd      t1, 264(sp)       // tf.sstatus
-    sd      t2, 272(sp)       // tf.scause
+    sd      t0, 256(sp)
+    sd      t1, 264(sp)
+    sd      t2, 272(sp)
     csrr    t0, stval
-    sd      t0, 280(sp)       // tf.stval
+    sd      t0, 280(sp)
 
-    sd      zero, 0(sp)       // tf.regs.zero
-    sd      ra, 8(sp)          // tf.regs.ra
-    csrr    t0, sscratch       // saved sp (user sp or old kernel sp from csrrw)
-    sd      t0, 16(sp)         // tf.regs.sp
-    sd      gp, 24(sp)         // tf.regs.gp
-    sd      tp, 32(sp)         // tf.regs.tp
-    // t0,t1,t2 already saved
-    sd      s0, 64(sp)         // tf.regs.s0
-    sd      s1, 72(sp)         // tf.regs.s1
-    sd      a0, 80(sp)         // tf.regs.a0
-    sd      a1, 88(sp)         // tf.regs.a1
-    sd      a2, 96(sp)         // tf.regs.a2
-    sd      a3, 104(sp)        // tf.regs.a3
-    sd      a4, 112(sp)        // tf.regs.a4
-    sd      a5, 120(sp)        // tf.regs.a5
-    sd      a6, 128(sp)        // tf.regs.a6
-    sd      a7, 136(sp)        // tf.regs.a7
-    sd      s2, 144(sp)        // tf.regs.s2
-    sd      s3, 152(sp)        // tf.regs.s3
-    sd      s4, 160(sp)        // tf.regs.s4
-    sd      s5, 168(sp)        // tf.regs.s5
-    sd      s6, 176(sp)        // tf.regs.s6
-    sd      s7, 184(sp)        // tf.regs.s7
-    sd      s8, 192(sp)        // tf.regs.s8
-    sd      s9, 200(sp)        // tf.regs.s9
-    sd      s10, 208(sp)       // tf.regs.s10
-    sd      s11, 216(sp)       // tf.regs.s11
-    sd      t3, 224(sp)        // tf.regs.t3
-    sd      t4, 232(sp)        // tf.regs.t4
-    sd      t5, 240(sp)        // tf.regs.t5
-    sd      t6, 248(sp)        // tf.regs.t6
+    sd      zero, 0(sp)
+    sd      ra, 8(sp)
+    sd      gp, 24(sp)                // save user gp
+    la      t0, {kernel_gp_ptr}        // restore kernel gp (per-CPU base)
+    ld      gp, 0(t0)
+    sd      tp, 32(sp)                // save user tp
+    sd      s0, 64(sp)
+    sd      s1, 72(sp)
+    sd      a0, 80(sp)
+    sd      a1, 88(sp)
+    sd      a2, 96(sp)
+    sd      a3, 104(sp)
+    sd      a4, 112(sp)
+    sd      a5, 120(sp)
+    sd      a6, 128(sp)
+    sd      a7, 136(sp)
+    sd      s2, 144(sp)
+    sd      s3, 152(sp)
+    sd      s4, 160(sp)
+    sd      s5, 168(sp)
+    sd      s6, 176(sp)
+    sd      s7, 184(sp)
+    sd      s8, 192(sp)
+    sd      s9, 200(sp)
+    sd      s10, 208(sp)
+    sd      s11, 216(sp)
+    sd      t3, 224(sp)
+    sd      t4, 232(sp)
+    sd      t5, 240(sp)
+    sd      t6, 248(sp)
 
     li      t0, 1
-    sd      t0, 288(sp)        // tf.kind = Trap
+    sd      t0, 288(sp)
 
-    // Step 5: a0 = trap_type (0=exception, 1=interrupt)
+    // call stub
     csrr    t0, scause
-    srli    a0, t0, 63         // MSB of scause: 1=interrupt, 0=exception
-
-    // a1 = privilege (invert sstatus.SPP: SPP=0 → user=1, SPP=1 → kernel=0)
-    csrr    t0, sstatus
-    srli    a1, t0, 8
-    andi    a1, a1, 1
-    xori    a1, a1, 1
-
-    // Step 6: call Rust stub with trap frame pointer
-    mv      a2, sp             // a2 = &UserTrapFrame
+    srli    a0, t0, 63           // a0 = trap_type
+    li      a1, 0                // a1 = privilege (kernel mode)
+    mv      a2, sp               // a2 = &UserTrapFrame
+    li      a3, 0                // a3 = no task_ptr (stub will use libvsched2::current_task_ptr)
     call    vsched2_trap_entry_stub
     j       .
 
-    .section .data
-    .globl V_KSATP
-    .align 3
-V_KSATP:
-    .dword 0
-    .section .text
-
 "#,
+    kernel_satp_ptr = sym crate::vsched::KERNEL_SATP_VAL,
+    kernel_gp_ptr = sym crate::vsched::KERNEL_GP,
+    trap_scratch_ptr = sym crate::vsched::TRAP_SCRATCH,
 );
-
-unsafe extern "C" {
-    fn V_KSATP();
-}
-
-pub fn set_kernel_satp(satp: usize) {
-    unsafe { core::ptr::write_volatile(V_KSATP as *mut usize, satp); }
-}
 
 #[unsafe(no_mangle)]
 extern "C" fn vsched2_direct_entry_stub(trap_type: usize, privilege: usize) -> ! {
@@ -157,13 +134,37 @@ extern "C" fn vsched2_trap_entry_stub(
     trap_type: usize,
     privilege: usize,
     tf_stack: *const UserTrapFrame,
+    task_ptr: *const (),
 ) -> ! {
-    let heap_tf = alloc::boxed::Box::new(unsafe { core::ptr::read(tf_stack) });
-    let tf_ptr = alloc::boxed::Box::into_raw(heap_tf);
+    // For timer interrupts, acknowledge by setting stimecmp to a future time
+    let tf = unsafe { &*tf_stack };
+    if tf.scause == 0x8000000000000005 {
+        unsafe {
+            core::arch::asm!("li {t}, -1", "csrw stimecmp, {t}", t = out(reg) _);
+        }
+    }
 
-    let current_task = libvsched2::current_task_ptr();
-    if !current_task.is_null() {
-        let vti = unsafe { &*(current_task as *const VschedTaskImpl) };
+    // TF_STORAGE pool to avoid nested-trap overwrite
+    static TRAP_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    static mut TF_POOL: [UserTrapFrame; 4] = unsafe { core::mem::zeroed() };
+    let trap_n = TRAP_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let idx = trap_n & 3;
+    unsafe { core::ptr::copy_nonoverlapping(tf_stack, &raw mut TF_POOL[idx], 1) };
+    let tf_ptr = unsafe { &raw mut TF_POOL[idx] as *mut UserTrapFrame };
+
+    // Diagnostic: print first 200 traps
+    if trap_n < 200 {
+        let tf = unsafe { &*tf_stack };
+        axlog::ax_println!("[trap#{}] scause={:#x} sepc={:#x} stval={:#x}",
+            trap_n, tf.scause, tf.sepc, tf.stval);
+    }
+
+    let mut task_ptr = task_ptr;
+    if task_ptr.is_null() {
+        task_ptr = libvsched2::current_task_ptr();
+    }
+    if !task_ptr.is_null() {
+        let vti = unsafe { &*(task_ptr as *const VschedTaskImpl) };
         vti.trap_frame.store(tf_ptr as usize, core::sync::atomic::Ordering::Release);
     }
 
@@ -172,12 +173,11 @@ extern "C" fn vsched2_trap_entry_stub(
     };
     unsafe {
         core::arch::asm!(
-            "mv a0, {t}",
-            "mv a1, {p}",
             "jalr {f}",
-            t = in(reg) trap_type,
-            p = in(reg) privilege,
             f = in(reg) entry,
+            in("a0") trap_type,
+            in("a1") privilege,
+            in("a2") task_ptr,
             options(noreturn),
         );
     }

@@ -345,6 +345,18 @@ pub fn load_user_app(
 
     crate::vsched::context::set_process_vdso_base(vdso_start.as_usize());
 
+    // Pre-populate VDSO BSS areas (new_alloc backend) to avoid page faults
+    {
+        let areas_info: Vec<_> = uspace.areas().map(|a| (a.start(), a.end(), a.flags())).collect();
+        for (start, end, flags) in areas_info {
+            let mut vaddr = start;
+            while vaddr < end {
+                let _ = uspace.handle_page_fault(vaddr, flags);
+                vaddr += memory_addr::PAGE_SIZE_4K;
+            }
+        }
+    }
+
     auxv.push(AuxEntry::new(AuxType::SYSINFO_EHDR, vdso_start.into()));
 
     let stack_data = app_stack_region(args, envs, &auxv, ustack_top.into());
