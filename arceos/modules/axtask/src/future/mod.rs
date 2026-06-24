@@ -1,6 +1,9 @@
 //! Future support.
 
-use alloc::{sync::Arc, task::Wake};
+use alloc::{
+    sync::Arc,
+    task::Wake,
+};
 use core::{
     fmt,
     future::poll_fn,
@@ -13,15 +16,6 @@ use kernel_guard::NoPreemptIrqSave;
 use kspin::SpinNoIrq;
 
 use crate::{AxTaskRef, WeakAxTaskRef, current, current_run_queue, select_run_queue};
-
-/// Minimal Waker for vsched2 block_on — the wake signal is ignored in the
-/// yield-based vsched2 path because the vsched2 scheduler will re-poll
-/// the blocked task when it is next scheduled.
-struct VschedWaker;
-
-impl Wake for VschedWaker {
-    fn wake(self: Arc<Self>) {}
-}
 
 mod poll;
 pub use poll::*;
@@ -61,31 +55,43 @@ impl Wake for AxWaker {
 /// Note that this doesn't handle interruption and is not recommended for direct
 /// use in most cases.
 pub fn block_on<F: IntoFuture>(f: F) -> F::Output {
+    let mut fut = pin!(f.into_future());
+
     if crate::api::vsched2_active() {
-        // vsched2 active: use poll + yield loop (each yield goes to vsched2).
-        // Wake events from unblock_task go through the legacy AxRunQueue,
-        // but we poll on each reschedule, so blocked tasks naturally progress.
-        let mut fut = pin!(f.into_future());
-        let waker = Waker::from(Arc::new(VschedWaker));
+        // vsched2 active: poll + yield loop.
+        // Each yield_now() goes through vsched2's yield trampoline → kschedule.
+        // Use AxWaker so external wakes (child_exit_event, futex, etc.) set the
+        // `woke` flag. The poll_fn (e.g. wait4's check_children) re-checks
+        // state on each iteration. When the child exits, check_children finds
+        // the zombie and returns Ready.
+        let curr = current();
+        let task = curr.clone();
+        let axwaker = AxWaker::new(&task);
+        let waker = Waker::from(axwaker.clone());
         let mut cx = Context::from_waker(&waker);
         loop {
             match fut.as_mut().poll(&mut cx) {
                 Poll::Pending => {
-                    crate::yield_now();
+                    let woke = axwaker.woke.lock();
+                    if !*woke {
+                        drop(woke);
+                        // Mark Ready so vsched2's push_prev_task re-queues us.
+                        // Without this, Blocked tasks are invisible to push_prev_task
+                        // and get permanently lost from the ready_queue.
+                        task.set_state(crate::TaskState::Ready);
+                        crate::yield_now();
+                    } else {
+                        drop(woke);
+                    }
                 }
                 Poll::Ready(output) => return output,
             }
         }
     }
 
-    let mut fut = pin!(f.into_future());
-    // ... rest of original block_on ...
-
+    // Original AxRunQueue path (when vsched2 is not active):
     let curr = current();
-    // It's necessary to keep a strong reference to the current task
-    // to prevent it from being dropped while blocking.
     let task = curr.clone();
-
     let axwaker = AxWaker::new(&task);
     let waker = Waker::from(axwaker.clone());
     let mut cx = Context::from_waker(&waker);
@@ -98,7 +104,6 @@ pub fn block_on<F: IntoFuture>(f: F) -> F::Output {
                 if !*woke {
                     rq.blocked_resched(woke);
                 } else {
-                    // Immediately woken
                     drop(woke);
                     crate::yield_now();
                 }

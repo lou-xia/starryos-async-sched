@@ -109,7 +109,9 @@ fn create_vsched_init_task(args: &[String], envs: &[String]) -> (*const starry_c
     // 从 UserContext 拷贝关键寄存器
     tf.regs.a0 = uctx.regs.a0;
     tf.regs.sp = uctx.regs.sp;
-    tf.regs.ra = entry_ra;
+    // User entry point: ra=0 so a stray 'ret' crashes cleanly instead
+    // of jumping to a kernel address.
+    tf.regs.ra = 0;
     let tf_ptr = Box::into_raw(tf);
 
     let vti = starry_core::vsched::register_task(task_ref.clone(), 0, 1, None);

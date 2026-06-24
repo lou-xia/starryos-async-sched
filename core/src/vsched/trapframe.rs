@@ -1,7 +1,7 @@
 //! 用户态 trap 帧结构定义及恢复函数。
 //!
 //! `UserTrapFrame` 布局与 `axcpu::TrapFrame` 对齐，包含 32 个通用寄存器
-//!（含 zero）+ sepc / sstatus / scause / stval + kind（Yield / Trap）。
+//! （含 zero）+ sepc / sstatus / scause / stval + kind（Yield / Trap）。
 //!
 //! ### 恢复路径概要
 //!
@@ -9,11 +9,10 @@
 //! |------|---------|--------|---------|
 //! | `restore_and_sret` | `into_user_context` | S-mode | sepc, sstatus, sret |
 //! | `restore_and_jump(Yield)` | yield 恢复 | U/S 均可 | 无 |
-//! | `restore_and_jump(Trap)` | preemption 恢复 | **仅 S-mode** | sscratch |
+//! | `restore_and_jump(Trap)` | preemption 恢复 | **仅 S-mode** | 无 (sepc 从 tf offset 256 重读) |
 //!
-//! **注意**：`restore_and_jump(Trap)` 使用了 `csrw sscratch` / `csrr sscratch`，
-//! 在 U-mode 执行会触发 illegal instruction。这是因为当前不支持用户态中断。
-//! 如果将来需要用户态 preemption，需在此分支实现不依赖 CSR 的暂存方案。
+//! `restore_and_jump(Trap)` 恢复全部 31 GPR 后从 offset 256 重读 sepc
+//! 跳转。GPR 恢复仅覆盖 offset 0~248，sepc 在 offset 256 处始终完好。无需暂存。
 
 #[repr(C)]
 pub struct UserGeneralRegs {
@@ -58,7 +57,7 @@ pub enum UserTrapFrameKind {
     /// 主动让权，仅 callee-saved 寄存器有效。
     Yield = 0,
     /// 被中断/异常打断，全部 32 寄存器 + sepc / sstatus / scause / stval 有效。
-    Trap = 1,
+    Trap  = 1,
 }
 
 #[repr(C)]
@@ -268,15 +267,16 @@ impl UserTrapFrame {
                 unimplemented!();
             }
             UserTrapFrameKind::Trap => {
-                // 仅 S-mode：用 sscratch 暂存 sepc，全量恢复后取回跳转。
-                // U-mode 执行 csrw/csrr sscratch 会 illegal instruction。
+                // 全量恢复 31 GPR + sp，最后从 trap frame 重读 sepc 跳转。
+                // 不使用 sscratch 暂存 —— sepc 在 offset 256 处从不被覆盖，
+                // 只需在 GPR 恢复后 ld 一次即可。避免 sscratch 污染导致
+                // 嵌套异常时 trap 向量把 sepc 当预保存栈用。
+                // U-mode 执行此处 csr 指令会 illegal instruction，
                 // 将来支持用户态 preemption 时需改用不依赖 CSR 的方案。
                 #[cfg(target_arch = "riscv64")]
                 unsafe {
                     core::arch::asm!(
                         "mv     sp, {tf}",
-                        "ld     t0, 256(sp)",     // sepc → t0
-                        "csrw   sscratch, t0",    // 暂存到 sscratch
                         // 全量恢复 31 GPR
                         "ld     ra, 8(sp)",
                         "ld     gp, 24(sp)",
@@ -308,7 +308,8 @@ impl UserTrapFrame {
                         "ld     t4, 232(sp)",
                         "ld     t5, 240(sp)",
                         "ld     t6, 248(sp)",
-                        "csrr   t0, sscratch",    // 取回 sepc
+                        // sepc 在 offset 256, 上面的 GPR 恢复从未碰它
+                        "ld     t0, 256(sp)",
                         "ld     sp, 16(sp)",
                         "jr     t0",
                         tf = in(reg) self,

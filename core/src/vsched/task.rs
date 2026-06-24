@@ -1,14 +1,18 @@
 //! VschedTaskImpl — vsched2 Task 接口的 StarryOS 实现。
 
 use alloc::{boxed::Box, sync::Arc};
-use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
-use core::task::Poll;
+use core::{
+    sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering},
+    task::Poll,
+};
 
 use axtask::{AxTaskRef, TaskState as AxTaskState};
 use memory_addr;
 
-use super::trapframe::{UserTrapFrame, UserTrapFrameKind};
-use super::{from_vsched_state, to_vsched_state};
+use super::{
+    from_vsched_state, to_vsched_state,
+    trapframe::{UserTrapFrame, UserTrapFrameKind},
+};
 
 /// 协程轮询接口。实现该 trait 的任务被 vsched2 作为协程调度。
 pub trait CoroutinePoll: Send + Sync {
@@ -110,6 +114,14 @@ impl libvsched2::Task for VschedTaskImpl {
         let tf_ptr = self.trap_frame.load(Ordering::Acquire);
         assert_ne!(tf_ptr, 0, "restore_context: trap_frame is null");
         let tf = unsafe { &*(tf_ptr as *const UserTrapFrame) };
+        axlog::ax_println!(
+            "[restore_ctx] pid={} kind={} sepc={:#x} sp={:#x} sstatus={:#x}",
+            self.pid.load(Ordering::Acquire),
+            tf.kind as usize,
+            tf.sepc,
+            tf.regs.sp,
+            tf.sstatus,
+        );
         unsafe { tf.restore_and_jump() };
     }
 

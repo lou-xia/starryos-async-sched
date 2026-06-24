@@ -3,7 +3,7 @@ use alloc::sync::Arc;
 use axerrno::{AxError, AxResult};
 use axfs::FS_CONTEXT;
 use axhal::uspace::UserContext;
-use axtask::{AxTaskExt, current, spawn_task};
+use axtask::{AxTaskExt, current, spawn_task, vsched2_active};
 use bitflags::bitflags;
 use kspin::SpinNoIrq;
 use linux_raw_sys::general::*;
@@ -216,13 +216,23 @@ pub fn sys_clone(
         (parent_tid as *mut i32).vm_write(pidfd.add_to_fd_table(true)?)?;
     }
 
-    let thr = Thread::new(tid, new_proc_data);
-    if flags.contains(CloneFlags::CHILD_CLEARTID) {
-        thr.set_clear_child_tid(child_tid);
-    }
-    *new_task.task_ext_mut() = Some(unsafe { AxTaskExt::from_impl(thr) });
-
-    let task = spawn_task(new_task);
+    let task = if vsched2_active() {
+        // vsched2 is the active scheduler: create a vsched2 task instead
+        // of pushing to the legacy AxRunQueue (which is dormant under vsched2).
+        let thr = Thread::new(tid, new_proc_data);
+        if flags.contains(CloneFlags::CHILD_CLEARTID) {
+            thr.set_clear_child_tid(child_tid);
+        }
+        *new_task.task_ext_mut() = Some(unsafe { AxTaskExt::from_impl(thr) });
+        crate::task::new_vsched_user_task(new_task, &new_uctx)
+    } else {
+        let thr = Thread::new(tid, new_proc_data);
+        if flags.contains(CloneFlags::CHILD_CLEARTID) {
+            thr.set_clear_child_tid(child_tid);
+        }
+        *new_task.task_ext_mut() = Some(unsafe { AxTaskExt::from_impl(thr) });
+        spawn_task(new_task)
+    };
     add_task_to_table(&task);
 
     Ok(tid as _)

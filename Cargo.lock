@@ -1571,6 +1571,7 @@ dependencies = [
  "elf_parser",
  "include_bytes_aligned",
  "lazyinit",
+ "log",
  "page_table_entry",
  "vqueue",
  "xmas-elf",
@@ -1584,6 +1585,7 @@ dependencies = [
  "elf_parser",
  "include_bytes_aligned",
  "lazyinit",
+ "log",
  "page_table_entry",
  "vsched2",
  "xmas-elf",
@@ -2615,9 +2617,10 @@ dependencies = [
 [[package]]
 name = "vdso_helper"
 version = "0.1.0"
-source = "git+https://github.com/rosy233333/vdso_crate_template#a81f4e4312cc54e26bb30b9fc5796896e2815241"
+source = "git+https://github.com/rosy233333/vdso_crate_template#ead7e15a508d36ccbe3a898cef19634c52d08b7b"
 dependencies = [
  "lazyinit",
+ "log",
  "paste",
  "vsched_hal",
 ]

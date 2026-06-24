@@ -1,14 +1,14 @@
+use alloc::{
+    alloc::{Layout, alloc},
+    boxed::Box,
+    string,
+    sync::Arc,
+};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use alloc::alloc::{Layout, alloc};
-use alloc::boxed::Box;
-use alloc::sync::Arc;
-use alloc::string;
-
-use axtask::TaskState as AxTaskState;
+use axhal::{asm, mem::phys_to_virt};
 use axmm;
-use axhal::{mem::phys_to_virt, asm};
-
+use axtask::TaskState as AxTaskState;
 use libvsched2::{self, Stack as _};
 use vdso;
 
@@ -17,11 +17,11 @@ mod smp;
 pub mod stack;
 pub mod task;
 pub mod trap;
-pub mod trapframe;
 mod trap_vector;
+pub mod trapframe;
 mod userdata;
 
-pub use task::{CoroutinePoll, register_task, task_from_raw, VschedTaskImpl};
+pub use task::{CoroutinePoll, VschedTaskImpl, register_task, task_from_raw};
 
 use crate::config;
 
@@ -34,19 +34,25 @@ static VSCHED2_READY: AtomicBool = AtomicBool::new(false);
 
 /// 内核 SATP 值，在 activate_vsched_trap_vector 时写入, trap 向量直接加载
 pub static KERNEL_SATP_VAL: AtomicUsize = AtomicUsize::new(0);
-/// trap 向量暂存用户 t0
-pub static TRAP_SCRATCH: AtomicUsize = AtomicUsize::new(0);
-/// 内核 gp 值, activate_vsched_trap_vector 时记录, trap 向量恢复 (per-CPU access)
+/// trap 向量在 sscratch 被覆盖前保存的原始值, trap_entry 用于回收旧预保存栈
+pub static SAVED_SSCRATCH: AtomicUsize = AtomicUsize::new(0);
+/// 内核 gp 值, activate_vsched_trap_vector 时记录, trap 向量恢复
 pub static KERNEL_GP: AtomicUsize = AtomicUsize::new(0);
+/// trap 向量暂存用户 t0 (避免用用户栈)
+pub static TRAP_SCRATCH: AtomicUsize = AtomicUsize::new(0);
 /// 最近一次进入用户态前保存的任务指针
 pub static LAST_USER_TASK: AtomicUsize = AtomicUsize::new(0);
 /// 当前活跃用户页表根, 用于陷阱向量进入 VDSO 前切换页表
 pub static LAST_USER_PT_ROOT: AtomicUsize = AtomicUsize::new(0);
 pub static KERNEL_VVAR_BASE: AtomicUsize = AtomicUsize::new(0);
 pub static KERNEL_KSCHEDULER: AtomicUsize = AtomicUsize::new(0);
+pub static PRE_SAVE_BASE: AtomicUsize = AtomicUsize::new(0);
+pub static PRE_SAVE_TOP: AtomicUsize = AtomicUsize::new(0);
 
 pub const HIGHEST_PRIORITY: isize = 0;
 pub const LOWEST_PRIORITY: isize = 15;
+/// KERNEL_STACK_SIZE for trap vector assembly offset adjustment
+pub const KERNEL_STACK: usize = config::KERNEL_STACK_SIZE;
 
 pub fn to_vsched_state(s: AxTaskState) -> libvsched2::TaskState {
     match s {
@@ -86,8 +92,7 @@ pub fn init_vsched2_interfaces() {
     libvsched2::init_vtable_SMP::<smp::VschedSmpImpl>();
     libvsched2::init_vtable_VSpace::<context::VschedVSpaceImpl>();
     libvsched2::init_vtable_UserData::<userdata::VschedUserDataImpl>();
-
-    // Dump VDSO_VTABLE to verify no BSS entries
+    context::init_raw_run_task_offset();
 }
 
 unsafe extern "C" {
@@ -99,7 +104,10 @@ pub fn activate_vsched_trap_vector() {
     let layout = alloc::alloc::Layout::from_size_align(262144 + 8, 16).unwrap();
     let raw: *mut u8 = unsafe { alloc::alloc::alloc(layout) };
     assert!(!raw.is_null(), "failed to alloc pre-save stack");
+    let stack_base = raw as usize;
     let stack_top = raw as usize + 262144;
+    PRE_SAVE_BASE.store(raw as usize, Ordering::Release);
+    PRE_SAVE_TOP.store(stack_top, Ordering::Release);
     let kernel_satp: usize;
     unsafe {
         core::arch::asm!("csrr {}, satp", out(reg) kernel_satp);
@@ -120,8 +128,12 @@ pub fn activate_vsched_trap_vector() {
             "csrr {}, sstatus",
             out(reg) stvec_val, out(reg) sie_val, out(reg) sstatus_val,
         );
-        axlog::ax_println!("vsched2: stvec={:#x} sie={:#x} sstatus={:#x}",
-            stvec_val, sie_val, sstatus_val);
+        axlog::ax_println!(
+            "vsched2: stvec={:#x} sie={:#x} sstatus={:#x}",
+            stvec_val,
+            sie_val,
+            sstatus_val
+        );
         core::arch::asm!("csrw sscratch, {}", in(reg) stack_top);
         axhal::asm::write_trap_vector_base(vsched2_trap_vector as *const () as usize);
     }
@@ -129,6 +141,16 @@ pub fn activate_vsched_trap_vector() {
 
 pub fn push_task_to_kernel(task_ptr: *const ()) {
     libvsched2::push_task_into_current(task_ptr);
+}
+
+/// 读取 vsched2 的当前任务指针 (CURRENT_TASK in VVAR)。
+pub fn current_task_ptr() -> *const () {
+    libvsched2::current_task_ptr()
+}
+
+/// 设置 vsched2 的当前任务指针 (CURRENT_TASK in VVAR)。
+pub fn set_current_task_ptr(task: *const ()) {
+    libvsched2::set_current_task_ptr(task);
 }
 
 /// 分配一个用于 vsched2 的 Stack 对象
@@ -152,14 +174,13 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace_ptr: Option<*m
     // 分配一个 Stack 对象作为内核主任务的初始栈
     let init_stack_ptr = alloc_stack();
     unsafe { (main_ptr as *mut VschedTaskImpl).as_mut().unwrap() }
-        .thread_stack_ptr.store(init_stack_ptr as usize, Ordering::Release);
+        .thread_stack_ptr
+        .store(init_stack_ptr as usize, Ordering::Release);
 
     unsafe {
-        libvsched2::VDSO_VTABLE.kernel_init_main
-            .expect("kernel_init_main not in vtable")(
-                init_stack_ptr,
-                main_ptr as *const (),
-            );
+        libvsched2::VDSO_VTABLE
+            .kernel_init_main
+            .expect("kernel_init_main not in vtable")(init_stack_ptr, main_ptr as *const ());
     }
     axlog::ax_println!("vsched2: kernel_init_main done");
 
@@ -169,8 +190,8 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace_ptr: Option<*m
         if !aspace_ptr.is_null() {
             let aspace = unsafe { &*(aspace_ptr as *const axmm::AddrSpace) };
             let root = aspace.page_table_root();
-            // Copy kernel mappings to user AS BEFORE switching PT,
-            // so kernel code can execute under user PT.
+            // Copy kernel mappings into user AS so kernel code can execute
+            // under the user page table without SATP switch on trap entry.
             {
                 let mut user_aspace = unsafe { &mut *(aspace_ptr as *mut axmm::AddrSpace) };
                 let kernel_aspace = axmm::kernel_aspace().lock();
@@ -188,17 +209,18 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace_ptr: Option<*m
         let pid = libvsched2::process_init(vspace_ptr);
         axlog::ax_println!("vsched2: process_init pid={}", pid);
         let pushed = libvsched2::push_task_into_process(init_task_ptr, pid);
-        axlog::ax_println!("vsched2: push_task_into_process pid={} result={}", pid, pushed);
+        axlog::ax_println!(
+            "vsched2: push_task_into_process pid={} result={}",
+            pid,
+            pushed
+        );
         unsafe {
             asm::write_user_page_table(kernel_root);
             asm::flush_tlb(None);
         }
     }
 
-    activate_vsched_trap_vector();
-    axlog::ax_println!("vsched2: trap vector active, entering scheduler");
-
-    // 将所有最新内核映射同步到用户页表。
+    // Sync any new kernel mappings from process_init into user PT.
     if let Some(vspace_ptr) = vspace_ptr {
         let aspace_ptr = unsafe { *vspace_ptr };
         if !aspace_ptr.is_null() {
@@ -207,6 +229,9 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace_ptr: Option<*m
             let _ = user_aspace.copy_mappings_from(&kernel_aspace);
         }
     }
+
+    activate_vsched_trap_vector();
+    axlog::ax_println!("vsched2: trap vector active, entering scheduler");
 
     axlog::ax_println!("vsched2: entering yield loop");
     loop {

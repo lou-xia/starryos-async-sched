@@ -6,6 +6,53 @@
 
 ## vsched2 核心设计
 
+### 三步调度模型
+
+vsched2 将调度循环分解为三个步骤：
+```
+步骤1: 执行流保存
+   └─ trap_vector (OS汇编): 切换到预保存栈, 保存全部寄存器+CSR, 恢复sscratch
+   └─ trap_entry (vsched2): 分配新预保存栈, 设置任务状态, push_trap → kschedule
+   └─ thread_entry (vsched2): yield时设置任务状态 → kschedule
+
+步骤2: 特权级与地址空间切换、任务调度
+   └─ kschedule / uschedule: push_prev_task → process_schedule → ktask_schedule
+      内核态: kschedule → process_schedule → ktask_schedule(0) → run_task
+      用户态: uschedule → select&pop → run_task
+      陷入内核: utok_schedule → select&pop → krun_utask
+   例外: 内核态运行用户任务时, 特权级切换延后到步骤3
+
+步骤3: 执行流恢复
+   └─ run_task: 内核线程→restore_context(), 内核协程→poll()
+   └─ krun_utask: 内核运行用户任务, 特权级切换在本步骤完成(sret)
+      用户线程→into_user_context→restore_and_sret
+      用户协程→into_user→sret to raw_run_task
+```
+
+### OS 与 vsched2 的职责边界
+
+```
+┌─ OS 负责 (纯汇编) ─────────────────────────────┐
+│ trap_vector: 保存上下文, 恢复sscratch, SUM/MXR │
+│ yield_trampoline: 保存callee-saved寄存器       │
+│ restore_and_sret/restore_and_jump: 恢复上下文   │
+└────────────────────────────────────────────────┘
+
+┌─ vsched2 负责 (vDSO .so) ──────────────────────┐
+│ trap_entry: 分配栈, 设置状态, push_trap         │
+│ thread_entry: 设置状态 → kschedule              │
+│ kschedule/uschedule/utok_schedule: 任务调度     │
+│ run_task/krun_utask: 栈管理, 上下文恢复入口     │
+│ trap_handler: 协程处理trap队列                  │
+└────────────────────────────────────────────────┘
+
+┌─ StarryOS 中转 ────────────────────────────────┐
+│ vsched2_trap_entry_stub: TF_POOL, stimecmp ack  │
+│ vsched_yield_entry_stub: heap Box分配           │
+│ vsched2_direct_entry_stub: into_kernel快速路径   │
+└────────────────────────────────────────────────┘
+```
+
 ### 调度入口
 ```
 raw_trap_entry ──→ trap_entry ──→ 分发:
@@ -24,14 +71,14 @@ raw_thread_entry ──→ thread_entry ──→ kschedule / uschedule
    - pid!=0: 切换到用户地址空间 → 从用户调度器取 → `krun_utask`
 4. `run_task`: 协程走 `poll()`, 线程走 `restore_context()`
 
-### 事件源 (Event Source)
+### 事件源
 调度器包含多个事件源, `pop_task()` 在事件源之间按优先级选择:
 - **ReadyQueue**: 默认就绪队列, 分优先级 FIFO
 - **TrapWaitQueue**: trap 处理队列, 存 `(TrapInfo, Option<task>)`
 
 当 trap 队列非空时, `take_task` 返回 trap handler 协程。
 
-### trap 处理 (最新设计 - 26.6.1)
+### trap 处理 (事件源驱动)
 ALL traps 统一走事件源:
 1. trap 进入 → `trap_entry` → 设置任务状态（同步=Blocked, 中断=Ready）
 2. 创建 TrapInfo + 可选择关联任务 → push 到 trap 队列
@@ -39,18 +86,41 @@ ALL traps 统一走事件源:
 4. trap handler 调用 `TrapInfo::handle` → 分析 scause → 处理（syscall/缺页/信号）
 5. 处理完后: `task.set_state(Ready)` → `scheduler.push_task(task)` → 唤醒任务
 
-### 任务运行
-- **协程**: `run_task` → `run_coroutine` → `poll()` → 返回 Poll::Ready/Pending
-- **线程(内核)**: `run_task` → `thread_trampoline` → `run_thread` → `restore_context()` → `restore_and_jump(Yield)` → `ret`
-- **线程(用户)**: `krun_utask` → `run_thread_into_user` → `into_user_context` → `restore_and_sret`
+### 任务运行路径
+- **协程(内核)**: `run_task` → `get_empty_stack` → `coroutine_trampoline` → `run_coroutine` → `poll()`
+- **线程(内核)**: `run_task` → `get_thread_stack(Some)` → `thread_trampoline` → `run_thread` → `restore_context()` → `restore_and_jump(Yield)` → `ret`
+- **线程(用户)**: `krun_utask` → `get_thread_stack(None)` → `run_thread_into_user` → `into_user_context` → `restore_and_sret`
+- **协程(用户)**: `krun_utask` → `get_empty_stack(user)` → `get_thread_stack(None)` → `run_coroutine_into_user` → `into_user(ustack)`
 
-## StarryOS 集成要点
+### 预保存栈 (sscratch) 约定
+- 初始栈: `activate_vsched_trap_vector` 分配 256KB 原始堆缓冲区
+- 每次 trap: `trap_entry` 中 `alloc_stack().base()` → `set_pre_stack!` 更新 sscratch
+- 旧栈回收: vsched2 预期 `trap_entry` 中将旧 sscratch 栈通过 `set_current_stack` 管理, 在 `run_task`/`krun_utask` 时回收
+- StarryOS 当前状态: 旧 sscratch 栈尚未回收 (TODO)
 
-### 关键文件
+### 初始化序列 (当前实现)
+
+```
+1. disable_irqs()
+2. init_vsched2_interfaces()         // 注册 7 个 trait + init_raw_run_task_offset
+3. register_vsched2_yield()          // 替换 axtask::yield_now → vsched_yield_trampoline
+4. kernel_init_main(init_stack, main) // vsched2: 初始化内核调度器(pid=0)
+5. copy_mappings_from(kernel→user)   // 内核页面映射到用户 PT
+6. write_user_page_table(user_root)  // 切入用户 PT
+7. process_init(vspace)              // vsched2: 创建进程调度器(pid=1)
+8. push_task_into_process(task, 1)   // vsched2: 推入用户任务
+9. write_user_page_table(kernel_root)// 切回内核 PT
+10. copy_mappings_from sync           // 同步 process_init 产生的新映射
+11. activate_vsched_trap_vector()     // 分配预保存栈, 设置 sscratch, 设置 stvec
+12. yield loop                        // call vsched_yield_trampoline 反复
+```
+
+## StarryOS 集成关键文件
+
 | 文件 | 职责 |
 |---|---|
-| `core/src/vsched/trap_vector.rs` | trap 向量: SATP切换, gp恢复, 上下文保存, stub调用, yield trampoline |
-| `core/src/vsched/trapframe.rs` | UserTrapFrame 结构及 restore_and_sret_user / restore_and_jump |
+| `core/src/vsched/trap_vector.rs` | trap 向量 (gp恢复, 上下文保存, stub调用, yield trampoline) |
+| `core/src/vsched/trapframe.rs` | UserTrapFrame 及 restore_and_sret / restore_and_jump |
 | `core/src/vsched/task.rs` | VschedTaskImpl: Task trait 实现, restore_context |
 | `core/src/vsched/context.rs` | VschedContextImpl: into_kernel/into_user/into_user_context; VschedVSpaceImpl: into_vspace |
 | `core/src/vsched/mod.rs` | bootstrap, trap vector 激活, 接口注册 |
@@ -62,20 +132,19 @@ ALL traps 统一走事件源:
 | `vsched/vsched2/src/arch/riscv.rs` | raw_trap_entry, raw_run_task, 汇编入口与跳板 |
 
 ### SATP 切换时机
-- `into_vspace` (VschedVSpaceImpl): 切换用户页表, 设置 SUM, flush TLB
-- `restore_and_sret_user`: 加载全部寄存器 → `csrw satp` → `sfence.vma` → `sret`
-  关键: trap frame 在 kernel heap, 必须在 kernel PT 下加载寄存器
+- **trap 入口**: 不切 SATP — 内核页面已映射在所有用户页表的高地址区域
+- **`into_vspace`**: 切换用户页表 (`write_user_page_table` + `sfence.vma` + SUM)
+- **`restore_and_sret`**: 全量恢复寄存器后 `sret`, 用户 PT 已由 `into_vspace` 提前激活
+- **`restore_and_sret_user`**: 先在内核 PT 加载寄存器, 再 `csrw satp` → `sfence.vma` → `sret`
 
 ### 页表映射
-- `copy_from_kernel`: 复制内核映射到用户地址空间
-- `copy_mappings_from`: 同步最新内核映射
-- `handle_page_fault` in restore_context: 确保用户代码页(0x100b0)已映射
+- `copy_from_kernel`: 创建用户 AS 时复制初始内核映射
+- `copy_mappings_from`: 同步最新内核映射到用户 PT（bootstrap 中调用两次: process_init 前+后）
 
-### 已修复的 Bug
-1. yield trampoline ra/sp 偏移互换 → 代码损坏
-2. bootstrap unreachable!() → 主任务恢复时崩溃
-3. trap_wait_queue 事件源顺序 → trap handler 优先
-4. set_pre_stack! 注释 → sscratch 不应修改
-5. 定时器中断 stimecmp 确认 → 防止无限重入
-6. trap dispatcher 中断忽略 → 不杀用户任务
-7. restore_and_sret_user SATP 切换 → kernel PT 下加载寄存器
+### 已知问题
+1. `trap_entry` 未回收旧 sscratch 栈 — 每次 trap 泄漏 64KB (TODO)
+2. `restore_and_jump(Trap)` 用 sscratch 暂存 sepc — 嵌套异常时破坏 sscratch (TODO)
+3. `restore_context` 对用户任务应分流到 `restore_and_sret` (TODO)
+4. `register_task` 对内核任务误设 `user_vdso_base` — 需在设置前判断 pid
+5. TrapInfo handler 协程 AXTask 永不释放
+6. `VschedStackImpl::dealloc` 时未从 free_stacks 移除, 产生悬空引用 (TODO)

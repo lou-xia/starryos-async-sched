@@ -1,20 +1,23 @@
-use alloc::boxed::Box;
-use alloc::sync::Arc;
-use core::sync::atomic::{AtomicUsize, Ordering};
-use core::task::Poll;
+use alloc::{boxed::Box, sync::Arc};
+use core::{
+    sync::atomic::{AtomicUsize, Ordering},
+    task::Poll,
+};
 
 use axtask::TaskState as AxTaskState;
 
+use super::{
+    HIGHEST_PRIORITY, register_task,
+    task::{CoroutinePoll, VschedTaskImpl},
+    trapframe::UserTrapFrame,
+};
 use crate::config;
-
-use super::task::{CoroutinePoll, VschedTaskImpl};
-use super::trapframe::UserTrapFrame;
-use super::{register_task, HIGHEST_PRIORITY};
 
 type TrapDispatcher = fn(trapped_task: *const VschedTaskImpl);
 
 // Last user task being serviced by trap handler (for page fault fallback)
-static LAST_TRAPPED_USER_TASK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static LAST_TRAPPED_USER_TASK: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 
 pub fn set_last_trapped_user_task(task: *const ()) {
     LAST_TRAPPED_USER_TASK.store(task as usize, Ordering::Release);
@@ -115,10 +118,12 @@ unsafe impl Sync for TrapHandlerCoroutine {}
 
 impl CoroutinePoll for TrapHandlerCoroutine {
     fn poll(&self) -> Poll<isize> {
-        let handler = self.handler_fn.load(Ordering::Acquire);
+        let handler_fn = self.handler_fn.load(Ordering::Acquire);
         let queue = self.queue.load(Ordering::Acquire);
-        let handler: fn(*const ()) = unsafe { core::mem::transmute(handler) };
+        axlog::ax_println!("[handler::poll] handler_fn={:#x} queue={:#x}", handler_fn, queue);
+        let handler: fn(*const ()) = unsafe { core::mem::transmute(handler_fn) };
         handler(queue as *const ());
+        axlog::ax_println!("[handler::poll] handler returned, writing P marker");
         unsafe { core::ptr::write_volatile(0xffffffc010000000 as *mut u8, b'P'); }
         Poll::Pending
     }

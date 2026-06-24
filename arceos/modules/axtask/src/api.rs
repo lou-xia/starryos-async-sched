@@ -19,7 +19,7 @@ pub fn register_vsched2_yield(yield_fn: unsafe extern "C" fn() -> !) {
 }
 
 /// Returns true if vsched2 yield is registered (non-zero).
-pub(crate) fn vsched2_active() -> bool {
+pub fn vsched2_active() -> bool {
     VSCHED2_YIELD.load(core::sync::atomic::Ordering::Acquire) != 0
 }
 

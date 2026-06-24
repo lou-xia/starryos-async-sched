@@ -1,11 +1,12 @@
 //! VschedContextImpl / VschedVSpaceImpl — 特权级切换与地址空间切换接口实现。
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+use axhal::mem::phys_to_virt;
 use axmm::AddrSpace;
 use memory_addr::PhysAddr;
-use axhal::mem::phys_to_virt;
-use core::sync::atomic::{AtomicUsize, Ordering};
-use super::trapframe::UserTrapFrame;
-use super::task::VschedTaskImpl;
+
+use super::{task::VschedTaskImpl, trapframe::UserTrapFrame};
 
 pub struct VschedContextImpl;
 pub struct VschedVSpaceImpl;
@@ -47,10 +48,14 @@ static CURRENT_PROCESS_VDSO_BASE: AtomicUsize = AtomicUsize::new(0);
 /// 在 `init_vsched2_interfaces` 中调用，计算 `raw_run_task` 的 .so 内偏移。
 pub fn init_raw_run_task_offset() {
     let kernel_addr = unsafe {
-        libvsched2::VDSO_VTABLE.raw_run_task.expect("raw_run_task not in vtable") as usize
+        libvsched2::VDSO_VTABLE
+            .raw_run_task
+            .expect("raw_run_task not in vtable") as usize
     };
-    let kernel_vdso_base =
-        phys_to_virt(PhysAddr::from(unsafe { crate::vsched::VSCHED2_VDSO_START_PA })).as_usize();
+    let kernel_vdso_base = phys_to_virt(PhysAddr::from(unsafe {
+        crate::vsched::VSCHED2_VDSO_START_PA
+    }))
+    .as_usize();
     RAW_RUN_TASK_OFFSET.store(kernel_addr - kernel_vdso_base, Ordering::Release);
 }
 
@@ -67,7 +72,9 @@ pub fn get_process_vdso_base() -> usize {
 /// `handle_syscall` 拦截到特殊 ecall 时调用的桥接函数。
 pub fn enter_raw_trap_entry() -> ! {
     let entry = unsafe {
-        libvsched2::VDSO_VTABLE.raw_trap_entry.expect("raw_trap_entry not in vtable")
+        libvsched2::VDSO_VTABLE
+            .raw_trap_entry
+            .expect("raw_trap_entry not in vtable")
     };
     unsafe {
         core::arch::asm!(
@@ -107,15 +114,20 @@ impl libvsched2::Context for VschedContextImpl {
         } else {
             0
         };
-        assert_ne!(user_vdso_base, 0, "into_user: user_vdso_base not set, did mm.rs call set_process_vdso_base?");
+        assert_ne!(
+            user_vdso_base, 0,
+            "into_user: user_vdso_base not set, did mm.rs call set_process_vdso_base?"
+        );
         let entry = user_vdso_base + offset;
 
         #[cfg(target_arch = "riscv64")]
         unsafe {
             core::arch::asm!(
                 "csrw   sepc, {entry}",
+                "li     t0, (1 << 5)",
+                "csrs   sstatus, t0",     // SPIE=1 → sret enables interrupts
                 "li     t0, (1 << 8)",
-                "csrc   sstatus, t0",
+                "csrc   sstatus, t0",     // SPP=0 → sret goes to U-mode
                 "mv     sp, {sp}",
                 "sret",
                 entry = in(reg) entry,
@@ -132,6 +144,32 @@ impl libvsched2::Context for VschedContextImpl {
         let tf_ptr = vsched_task.trap_frame.load(Ordering::Acquire);
         assert_ne!(tf_ptr, 0, "into_user_context: trap_frame is null");
         let tf = unsafe { &*(tf_ptr as *const UserTrapFrame) };
+        // Log suspicious kernel registers in the context being restored
+        let is_kva = |va: usize| va >= 0xffffffc000000000;
+        let regs = [
+            ("ra", tf.regs.ra), ("sp", tf.regs.sp), ("gp", tf.regs.gp), ("tp", tf.regs.tp),
+            ("t0", tf.regs.t0), ("t1", tf.regs.t1), ("t2", tf.regs.t2),
+            ("t3", tf.regs.t3), ("t4", tf.regs.t4), ("t5", tf.regs.t5), ("t6", tf.regs.t6),
+            ("a0", tf.regs.a0), ("a1", tf.regs.a1), ("a2", tf.regs.a2),
+            ("a3", tf.regs.a3), ("a4", tf.regs.a4), ("a5", tf.regs.a5),
+            ("s0", tf.regs.s0), ("s1", tf.regs.s1),
+        ];
+        let mut leak = false;
+        for &(name, val) in &regs {
+            if is_kva(val) && !leak {
+                axlog::ax_println!("[into_user_ctx] pid={} KERNEL regs:", vsched_task.pid.load(Ordering::Acquire));
+                leak = true;
+            }
+            if is_kva(val) {
+                axlog::ax_println!("  {}={:#x}", name, val);
+            }
+        }
+        if !leak {
+            axlog::ax_println!(
+                "[into_user_ctx] pid={} sepc={:#x} sp={:#x} clean",
+                vsched_task.pid.load(Ordering::Acquire), tf.sepc, tf.regs.sp,
+            );
+        }
         // into_vspace already switched SATP to user PT. Load regs and sret.
         unsafe { tf.restore_and_sret() };
     }
