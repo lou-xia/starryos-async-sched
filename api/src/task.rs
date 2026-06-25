@@ -110,7 +110,7 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
 pub fn new_vsched_user_task(
     mut new_task: TaskInner,
     uctx: &UserContext,
-) -> AxTaskRef {
+) -> (AxTaskRef, *const ()) {
     use alloc::boxed::Box;
     use core::sync::atomic::Ordering;
     use starry_core::vsched::trapframe::{UserTrapFrame, UserTrapFrameKind};
@@ -148,9 +148,10 @@ pub fn new_vsched_user_task(
     let stack_ptr = starry_core::vsched::alloc_stack();
     vti_ref.thread_stack_ptr.store(stack_ptr as usize, Ordering::Release);
 
-    starry_core::vsched::push_task_to_kernel(vti as *const ());
+    // Caller must push the task to the correct scheduler after process_init
+    let vti_raw = vti as *const ();
 
-    task_ref
+    (task_ref, vti_raw)
 }
 
 #[repr(C)]
@@ -386,12 +387,6 @@ fn vsched_trap_dispatcher(trapped_task: *const VschedTaskImpl) {
             // vsched2 manages vsched-level state; this sets AxRunQueue state.
             vti.task.set_state(AxTaskState::Running);
 
-            // Set vsched2's CURRENT_TASK to the trapped user task.
-            // block_on yields the handler; push_prev_task must see the
-            // PARENT as current to re-queue it correctly.
-            let handler_ptr = starry_core::vsched::current_task_ptr();
-            starry_core::vsched::set_current_task_ptr(trapped_task as *const ());
-
             // Set the active scope to the user task's scope so
             // scope-local variables (FD_TABLE etc.) resolve correctly.
             let scope_guard = vti.task.try_as_thread().map(|thr| {
@@ -408,15 +403,20 @@ fn vsched_trap_dispatcher(trapped_task: *const VschedTaskImpl) {
             drop(scope_guard);
             scope_local::ActiveScope::set_global();
 
-            // Restore vsched2's CURRENT_TASK back to the handler coroutine.
-            starry_core::vsched::set_current_task_ptr(handler_ptr);
-
             let tf_mut = unsafe { &mut *(tf_ptr as *mut UserTrapFrame) };
-            // Only update caller-saved registers that syscall may change.
+            let new_ip = uctx.ip();
+            let new_sp = uctx.regs.sp;
+            // Detect kernel address leakage into user sepc
+            if new_ip >= 0xffffffc000000000 {
+                axlog::ax_println!(
+                    "[ECALL CORRUPT] a7={} old_sepc={:#x} new_sepc={:#x} new_sp={:#x} ret={}",
+                    a7, tf_mut.sepc, new_ip, new_sp, uctx.arg0(),
+                );
+            }
             tf_mut.regs.a0 = uctx.arg0();  // return value
             tf_mut.regs.a1 = uctx.arg1();
-            tf_mut.regs.sp = uctx.regs.sp;
-            tf_mut.sepc = uctx.ip();
+            tf_mut.regs.sp = new_sp;
+            tf_mut.sepc = new_ip;
             tf_mut.sstatus = uctx.sstatus.bits();
             if a7 == 64 {
                 axlog::ax_println!("[write] fd={} len={} ret={}", tf.regs.a0, tf.regs.a2, tf_mut.regs.a0);
@@ -453,7 +453,7 @@ fn vsched_trap_dispatcher(trapped_task: *const VschedTaskImpl) {
         _ => MappingFlags::WRITE | MappingFlags::USER,
             };
             // Try trapped task first, then fall back to axtask::current()
-            let fixed = {
+            let mut fixed = {
                 if log_detail { axlog::ax_println!("[pf] try_as_thread: vti={}", vti.task.try_as_thread().is_some()); }
                 if let Some(thr) = vti.task.try_as_thread() {
                     let mut aspace = thr.proc_data.aspace.lock();

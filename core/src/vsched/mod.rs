@@ -143,6 +143,26 @@ pub fn push_task_to_kernel(task_ptr: *const ()) {
     libvsched2::push_task_into_current(task_ptr);
 }
 
+pub fn process_init(vspace_ptr: *mut *mut ()) -> usize {
+    // libvsched2::process_init(vspace_ptr)
+    axlog::ax_println!("[diag] process_init: ENTER vspace_ptr={:#x}", vspace_ptr as usize);
+    let pid = libvsched2::process_init(vspace_ptr);
+    axlog::ax_println!("[diag] process_init: RETURN pid={}", pid);
+    pid
+}
+
+pub fn user_init() {
+    libvsched2::user_init()
+}
+
+pub fn user_init_with_vspace(vspace: *mut ()) {
+    libvsched2::user_init_with_vspace(vspace)
+}
+
+pub fn push_task_into_process(task: *const (), pid: usize) -> bool {
+    libvsched2::push_task_into_process(task, pid)
+}
+
 /// 读取 vsched2 的当前任务指针 (CURRENT_TASK in VVAR)。
 pub fn current_task_ptr() -> *const () {
     libvsched2::current_task_ptr()
@@ -150,6 +170,7 @@ pub fn current_task_ptr() -> *const () {
 
 /// 设置 vsched2 的当前任务指针 (CURRENT_TASK in VVAR)。
 pub fn set_current_task_ptr(task: *const ()) {
+    axlog::ax_println!("[vsched::set_current] task={:#x}", task as usize);
     libvsched2::set_current_task_ptr(task);
 }
 
@@ -208,6 +229,17 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace_ptr: Option<*m
         axlog::ax_println!("vsched2: calling process_init...");
         let pid = libvsched2::process_init(vspace_ptr);
         axlog::ax_println!("vsched2: process_init pid={}", pid);
+        // --- Verification ---
+        axlog::ax_println!("[verify] vdso_pa={:#x} user_vdso_base={:#x}",
+            unsafe { VSCHED2_VDSO_START_PA },
+            crate::vsched::context::get_process_vdso_base());
+        axlog::ax_println!("vsched2: calling user_init_with_vspace...");
+        // user_init must run with the user PT active so that &USER_SCHEDULER
+        // inside init_sources resolves to the user vDSO copy.  We call
+        // user_init_with_vspace which translates the address to kva.
+        let aspace_ptr = unsafe { *vspace_ptr };
+        libvsched2::user_init_with_vspace(aspace_ptr);
+        axlog::ax_println!("vsched2: user_init done");
         let pushed = libvsched2::push_task_into_process(init_task_ptr, pid);
         axlog::ax_println!(
             "vsched2: push_task_into_process pid={} result={}",

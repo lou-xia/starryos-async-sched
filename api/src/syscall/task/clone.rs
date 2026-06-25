@@ -1,4 +1,5 @@
-use alloc::sync::Arc;
+use alloc::{boxed::Box, sync::Arc};
+use core::sync::atomic::Ordering;
 
 use axerrno::{AxError, AxResult};
 use axfs::FS_CONTEXT;
@@ -216,7 +217,7 @@ pub fn sys_clone(
         (parent_tid as *mut i32).vm_write(pidfd.add_to_fd_table(true)?)?;
     }
 
-    let task = if vsched2_active() {
+    if vsched2_active() {
         // vsched2 is the active scheduler: create a vsched2 task instead
         // of pushing to the legacy AxRunQueue (which is dormant under vsched2).
         let thr = Thread::new(tid, new_proc_data);
@@ -224,16 +225,46 @@ pub fn sys_clone(
             thr.set_clear_child_tid(child_tid);
         }
         *new_task.task_ext_mut() = Some(unsafe { AxTaskExt::from_impl(thr) });
-        crate::task::new_vsched_user_task(new_task, &new_uctx)
+        let (task, vti_ptr) = crate::task::new_vsched_user_task(new_task, &new_uctx);
+
+        if !flags.contains(CloneFlags::THREAD) {
+            axlog::ax_println!("[clone] calling process_init for child pid={}", tid);
+            let thr = task.try_as_thread().expect("vsched2 child must have thread");
+            let saved_root = axhal::asm::read_user_page_table();
+            let (child_root, vspace_ptr): (_, *mut *mut ()) = {
+                let guard = thr.proc_data.aspace.lock();
+                let root = guard.page_table_root();
+                let p: *mut () = &raw const *guard as *mut ();
+                (root, Box::into_raw(Box::new(p)))
+            };
+
+            // process_init uses 5-step get_user_data (returns kernel VA),
+            // safe under any page table.
+            let child_pid = starry_core::vsched::process_init(vspace_ptr);
+            axlog::ax_println!(
+                "[clone] process_init returned pid={}",
+                child_pid,
+            );
+            // Align vsched2 PID with the task so table[pid] lookups work later.
+            unsafe { &*(vti_ptr as *const starry_core::vsched::VschedTaskImpl) }
+                .pid.store(child_pid, Ordering::Release);
+
+            // user_init_with_vspace translates to kva internally,
+            // no PT switch needed.
+            starry_core::vsched::user_init_with_vspace(unsafe { *vspace_ptr });
+            starry_core::vsched::push_task_into_process(vti_ptr, child_pid);
+        }
+
+        add_task_to_table(&task);
     } else {
         let thr = Thread::new(tid, new_proc_data);
         if flags.contains(CloneFlags::CHILD_CLEARTID) {
             thr.set_clear_child_tid(child_tid);
         }
         *new_task.task_ext_mut() = Some(unsafe { AxTaskExt::from_impl(thr) });
-        spawn_task(new_task)
+        let task = spawn_task(new_task);
+        add_task_to_table(&task);
     };
-    add_task_to_table(&task);
 
     Ok(tid as _)
 }

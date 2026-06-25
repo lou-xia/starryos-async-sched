@@ -337,8 +337,17 @@ impl AddrSpace {
                             cb(self);
                         }
                         if n == 0 {
-                            warn!("No pages populated for {vaddr:?} ({flags:?})");
-                            false
+                            // The backend didn't populate any new pages.
+                            // If the PTE already exists (e.g. vDSO pages
+                            // mapped by MemIf::map), the page is already
+                            // accessible and the fault was a transient
+                            // TLB-miss or SUM access.
+                            if self.pt.query(vaddr).is_ok() {
+                                true
+                            } else {
+                                warn!("No pages populated for {vaddr:?} ({flags:?})");
+                                false
+                            }
                         } else {
                             true
                         }

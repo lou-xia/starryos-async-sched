@@ -86,22 +86,27 @@ impl libvsched2::TrapInfo for VschedTrapInfoImpl {
     }
 
     fn new_handler(queue: *const ()) -> *const () {
+        axlog::ax_println!("[new_handler] START queue={:#x}", queue as usize);
         let handler_fn = unsafe {
             libvsched2::VDSO_VTABLE
                 .trap_handler
                 .expect("trap_handler not in vtable")
         };
+        axlog::ax_println!("[new_handler] got handler_fn, creating task");
         let task_ref = axtask::new_raw(
             || {},
             alloc::string::String::from("trap_handler"),
             config::KERNEL_STACK_SIZE,
         );
+        axlog::ax_println!("[new_handler] axtask::new_raw done");
         task_ref.set_state(AxTaskState::Blocked);
         let coro = Arc::new(TrapHandlerCoroutine {
             handler_fn: AtomicUsize::new(handler_fn as usize),
             queue: AtomicUsize::new(queue as usize),
         });
+        axlog::ax_println!("[new_handler] about to register_task");
         let ptr = register_task(task_ref, HIGHEST_PRIORITY, 0, Some(coro));
+        axlog::ax_println!("[new_handler] DONE ptr={:#x}", ptr as usize);
         ptr as *const ()
     }
 }

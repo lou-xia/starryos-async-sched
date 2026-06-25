@@ -144,31 +144,18 @@ impl libvsched2::Context for VschedContextImpl {
         let tf_ptr = vsched_task.trap_frame.load(Ordering::Acquire);
         assert_ne!(tf_ptr, 0, "into_user_context: trap_frame is null");
         let tf = unsafe { &*(tf_ptr as *const UserTrapFrame) };
-        // Log suspicious kernel registers in the context being restored
-        let is_kva = |va: usize| va >= 0xffffffc000000000;
-        let regs = [
-            ("ra", tf.regs.ra), ("sp", tf.regs.sp), ("gp", tf.regs.gp), ("tp", tf.regs.tp),
-            ("t0", tf.regs.t0), ("t1", tf.regs.t1), ("t2", tf.regs.t2),
-            ("t3", tf.regs.t3), ("t4", tf.regs.t4), ("t5", tf.regs.t5), ("t6", tf.regs.t6),
-            ("a0", tf.regs.a0), ("a1", tf.regs.a1), ("a2", tf.regs.a2),
-            ("a3", tf.regs.a3), ("a4", tf.regs.a4), ("a5", tf.regs.a5),
-            ("s0", tf.regs.s0), ("s1", tf.regs.s1),
-        ];
-        let mut leak = false;
-        for &(name, val) in &regs {
-            if is_kva(val) && !leak {
-                axlog::ax_println!("[into_user_ctx] pid={} KERNEL regs:", vsched_task.pid.load(Ordering::Acquire));
-                leak = true;
-            }
-            if is_kva(val) {
-                axlog::ax_println!("  {}={:#x}", name, val);
-            }
-        }
-        if !leak {
+        axlog::ax_println!(
+            "[into_user_ctx] task={} pid={} tf={:#x} sepc={:#x} sp={:#x}",
+            vsched_task.task.id_name(),
+            vsched_task.pid.load(Ordering::Acquire),
+            tf_ptr, tf.sepc, tf.regs.sp,
+        );
+        if tf.sepc >= 0xffffffc000000000 {
             axlog::ax_println!(
-                "[into_user_ctx] pid={} sepc={:#x} sp={:#x} clean",
-                vsched_task.pid.load(Ordering::Acquire), tf.sepc, tf.regs.sp,
+                "[into_user_ctx] ABORT! kernel sepc={:#x}, NOT dispatching",
+                tf.sepc,
             );
+            loop { core::hint::spin_loop(); }
         }
         // into_vspace already switched SATP to user PT. Load regs and sret.
         unsafe { tf.restore_and_sret() };
