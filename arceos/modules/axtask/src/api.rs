@@ -101,6 +101,14 @@ pub fn init_scheduler() {
     init_scheduler_with_cpu_num(axconfig::plat::CPU_NUM);
 }
 
+/// Under vsched2, AxRunQueue is unused but may still be accessed by
+/// legacy code paths (AxWaker, timer tick, etc.). Initialize it as
+/// an empty queue to prevent LazyInit panics. Safe to call even if
+/// `init_scheduler()` already ran — `call_once` is idempotent.
+pub fn init_run_queue_empty() {
+    crate::run_queue::init_empty();
+}
+
 /// Initializes the task scheduler with cpu_num (for the primary CPU).
 pub fn init_scheduler_with_cpu_num(cpu_num: usize) {
     info!("Initialize scheduling...");
@@ -122,15 +130,13 @@ pub fn init_scheduler_secondary() {
 
 /// Handles periodic timer ticks for the task manager.
 ///
-/// For example, advance scheduler states, checks timed events, etc.
-#[cfg(feature = "irq")]
-#[doc(cfg(feature = "irq"))]
+/// If vsched2 is active, timer is handled by vsched2's trap entry; skip
+/// legacy AxRunQueue path entirely to avoid LazyInit panic.
 pub fn on_timer_tick() {
-    use kernel_guard::NoOp;
-    crate::timers::check_events();
-    // Since irq and preemption are both disabled here,
-    // we can get current run queue with the default `kernel_guard::NoOp`.
-    current_run_queue::<NoOp>().scheduler_timer_tick();
+    if vsched2_active() {
+        return;
+    }
+    current_run_queue::<kernel_guard::NoOp>().scheduler_timer_tick();
 }
 
 /// Adds the given task to the run queue, returns the task reference.
@@ -273,8 +279,10 @@ pub fn yield_now() {
     if f != 0 {
         let f: unsafe extern "C" fn() -> ! = unsafe { core::mem::transmute(f) };
         unsafe { f() };
+    } else {
+        log::warn!("[yield] VSCHED2_YIELD=0, falling back!");
+        current_run_queue::<NoPreemptIrqSave>().yield_current()
     }
-    current_run_queue::<NoPreemptIrqSave>().yield_current()
 }
 
 /// Current task is going to sleep for the given duration.

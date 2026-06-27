@@ -218,7 +218,14 @@ unsafe extern "C" fn vsched_yield_trampoline() -> ! {
         "sd     s2, 144(sp)", "sd     s3, 152(sp)", "sd     s4, 160(sp)",
         "sd     s5, 168(sp)", "sd     s6, 176(sp)", "sd     s7, 184(sp)",
         "sd     s8, 192(sp)", "sd     s9, 200(sp)", "sd     s10, 208(sp)",
-        "sd     s11, 216(sp)", "li     t0, 0", "sd     t0, 288(sp)",
+        "sd     s11, 216(sp)",
+        // sepc = ra (return address, so task resumes after yield)
+        "sd     ra, 256(sp)",
+        // sstatus = current sstatus with SPP=1 so sret goes to S-mode
+        "csrr   t0, sstatus", "ori    t0, t0, 0x100", "sd     t0, 264(sp)",
+        // scause/stval = 0 (no trap), kind = 0 (Yield)
+        "sd     zero, 272(sp)", "sd     zero, 280(sp)",
+        "li     t0, 0", "sd     t0, 288(sp)",
         "mv     a0, sp", "call   vsched_yield_entry_stub",
     )
 }

@@ -52,8 +52,15 @@ impl libvsched2::UserData for VschedUserDataImpl {
                 // Step 1: offset within .so
                 let offset = pos - kernel_vdso_start;
 
-                // Step 2: user vDSO base
-                let user_vdso_base = get_process_vdso_base();
+                // Step 2: user vDSO base — prefer per-AddrSpace, fall back to global
+                const KERNEL_BASE: usize = 0xffffffc000000000;
+                let user_vdso_base = match vspace {
+                    Some(ptr) if ptr as usize >= KERNEL_BASE => {
+                        let aspace = unsafe { &*(ptr as *const AddrSpace) };
+                        aspace.vdso_base
+                    }
+                    _ => get_process_vdso_base(),
+                };
                 if user_vdso_base == 0 {
                     return core::ptr::null_mut();
                 }
@@ -61,14 +68,8 @@ impl libvsched2::UserData for VschedUserDataImpl {
                 // Step 3: user VA
                 let user_va = user_vdso_base + offset;
 
-                axlog::ax_println!(
-                    "[get_user_data] pos={:#x} offset={:#x} user_va={:#x} vspace={:#x}",
-                    pos, offset, user_va,
-                    vspace.map_or(0, |v| v as usize),
-                );
-
                 // Step 4-5: query page table → PA → kernel VA
-                const KERNEL_BASE: usize = 0xffffffc000000000;
+                // (diagnostic logging suppressed for performance)
                 if let Some(vspace_ptr) = vspace {
                     if vspace_ptr as usize >= KERNEL_BASE {
                         let user_page = user_va & !0xfff;
@@ -78,22 +79,13 @@ impl libvsched2::UserData for VschedUserDataImpl {
                             aspace.page_table().query(VirtAddr::from(user_page))
                         {
                             let kva = phys_to_virt(pa).as_usize() + page_offset;
-                            axlog::ax_println!(
-                                "[get_user_data] 5-STEP: user_va={:#x} pa={:#x} kva={:#x}",
-                                user_va, pa, kva,
-                            );
                             return kva as *mut ();
                         }
                     }
                 }
 
                 // Fallback: return user VA.
-                axlog::ax_println!("[get_user_data] FALLBACK: returning user_va={:#x}", user_va);
-                // Valid when the target process's page table is active + SUM.
-                warn!(
-                    "[get_user_data] vspace not provided or invalid, returning user_va={:#x}",
-                    user_va
-                );
+                // (Valid when the target process's page table is active + SUM.)
                 return user_va as *mut ();
             }
         }

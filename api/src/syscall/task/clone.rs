@@ -1,10 +1,13 @@
-use alloc::{boxed::Box, sync::Arc};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::sync::atomic::Ordering;
 
 use axerrno::{AxError, AxResult};
 use axfs::FS_CONTEXT;
 use axhal::uspace::UserContext;
 use axtask::{AxTaskExt, current, spawn_task, vsched2_active};
+use axalloc::{global_allocator, UsageKind};
+use axhal::{paging::MappingFlags, mem::virt_to_phys};
+use memory_addr::{PAGE_SIZE_4K, VirtAddr};
 use bitflags::bitflags;
 use kspin::SpinNoIrq;
 use linux_raw_sys::general::*;
@@ -238,21 +241,91 @@ pub fn sys_clone(
                 (root, Box::into_raw(Box::new(p)))
             };
 
-            // process_init uses 5-step get_user_data (returns kernel VA),
-            // safe under any page table.
+            // Give the child its own vDSO/VVAR pages.  After
+            // try_clone(), LinearBackend maps parent and child to
+            // the same physical pages.  We unmap the old region and
+            // re-create it via map_so(), which gives the child its
+            // own .data/.bss pages with a fresh zero-filled bss
+            // (identical to load_user_app creation).
+            if !flags.contains(CloneFlags::VM) {
+                let user_vdso_base =
+                    starry_core::vsched::context::get_process_vdso_base();
+                axlog::ax_println!(
+                    "[clone] parent vdso_base={:#x} re-mapping vdso for child",
+                    user_vdso_base,
+                );
+                let vvar_size =
+                    unsafe { starry_core::vsched::VSCHED2_VVAR_SIZE };
+                let vdso_size =
+                    unsafe { starry_core::vsched::VSCHED2_VDSO_SIZE };
+                let vvar_start = user_vdso_base - vvar_size;
+                let vdso_end = user_vdso_base + vdso_size;
+
+                {
+                    let mut guard = thr.proc_data.aspace.lock();
+                    let to_unmap: Vec<_> = guard
+                        .areas()
+                        .filter(|a| {
+                            let s = a.start().as_usize();
+                            let e = a.end().as_usize();
+                            s >= vvar_start && e <= vdso_end
+                        })
+                        .map(|a| (a.start(), a.end()))
+                        .collect();
+                    for (start, end) in to_unmap {
+                        guard
+                            .unmap(start, end - start)
+                            .expect("clone: unmap vdso area failed");
+                    }
+                }
+
+                let aspace_ptr = unsafe { *vspace_ptr };
+                let new_vdso = starry_core::vsched::map_vdso_for_child(aspace_ptr);
+                {
+                    let mut guard = thr.proc_data.aspace.lock();
+                    guard.vdso_base = new_vdso as usize;
+
+                    let vdso_size = unsafe { starry_core::vsched::VSCHED2_VDSO_SIZE };
+                    let vdso_end_va = (new_vdso as usize) + vdso_size;
+                    if let Some(highest) = guard
+                        .areas()
+                        .filter(|a| a.start().as_usize() >= new_vdso as usize
+                                && a.end().as_usize() <= vdso_end_va)
+                        .map(|a| a.end().as_usize())
+                        .max()
+                    {
+                        if highest < vdso_end_va {
+                            let gap = vdso_end_va - highest;
+                            let kva = global_allocator()
+                                .alloc_pages(gap / PAGE_SIZE_4K, PAGE_SIZE_4K, UsageKind::VirtMem)
+                                .expect("clone: extend vdso pages failed");
+                            unsafe { core::ptr::write_bytes(kva as *mut u8, 0u8, gap) };
+                            guard
+                                .map_linear(
+                                    VirtAddr::from(highest),
+                                    virt_to_phys(VirtAddr::from(kva as usize)),
+                                    gap,
+                                    MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER,
+                                )
+                                .expect("clone: extend vdso map_linear failed");
+                        }
+                    }
+                }
+            }
+
             let child_pid = starry_core::vsched::process_init(vspace_ptr);
             axlog::ax_println!(
                 "[clone] process_init returned pid={}",
                 child_pid,
             );
-            // Align vsched2 PID with the task so table[pid] lookups work later.
             unsafe { &*(vti_ptr as *const starry_core::vsched::VschedTaskImpl) }
                 .pid.store(child_pid, Ordering::Release);
-
-            // user_init_with_vspace translates to kva internally,
-            // no PT switch needed.
             starry_core::vsched::user_init_with_vspace(unsafe { *vspace_ptr });
-            starry_core::vsched::push_task_into_process(vti_ptr, child_pid);
+            let pushed = starry_core::vsched::push_task_into_process(vti_ptr, child_pid);
+            axlog::ax_println!(
+                "[clone] push_task pid={} result={}, clone done",
+                child_pid, pushed,
+            );
         }
 
         add_task_to_table(&task);

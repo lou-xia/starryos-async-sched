@@ -246,6 +246,10 @@ pub fn sys_mmap(
     let populate = map_flags.contains(MmapFlags::POPULATE);
     aspace.map(start, length, permission_flags.into(), populate, backend)?;
 
+    if fd <= 0 {
+        axlog::ax_println!("[mmap] ANON start={:#x} len={:#x}", start.as_usize(), length);
+    }
+
     Ok(start.as_usize() as _)
 }
 

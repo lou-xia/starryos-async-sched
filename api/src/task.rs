@@ -238,7 +238,8 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
     }
 
     let process = &thr.proc_data.proc;
-    if process.exit_thread(curr.id().as_u64() as Pid, exit_code) {
+    let last_thread = process.exit_thread(curr.id().as_u64() as Pid, exit_code);
+    if last_thread {
         process.exit();
         if let Some(parent) = process.parent() {
             if let Some(signo) = thr.proc_data.exit_signal {
@@ -350,7 +351,7 @@ fn vsched_trap_dispatcher(trapped_task: *const VschedTaskImpl) {
             // Log first 30 and key syscalls: write(64), exit(93), exit_group(94), openat(56), read(63), dup(23)
             let a7 = tf.regs.a7;
             let is_key = a7 == 64 || a7 == 93 || a7 == 94 || a7 == 56 || a7 == 63 || a7 == 23;
-            if n < 30 || is_key {
+            if n < 200 || is_key {
                 axlog::ax_println!("[ecall#{}] a7={} a0={:#x} a1={:#x} a2={}", n, a7, tf.regs.a0, tf.regs.a1, tf.regs.a2);
             }
             // Periodically dump counts of last-seen syscalls
@@ -396,9 +397,19 @@ fn vsched_trap_dispatcher(trapped_task: *const VschedTaskImpl) {
                 guard
             });
 
+            // Save vsched2 CURRENT_TASK and temporarily set it to the
+            // trapped user task so that all syscall handlers can use
+            // current_task_ptr() correctly.
+            let saved_task = starry_core::vsched::current_task_ptr();
+            starry_core::vsched::set_current_task_ptr(trapped_task as *const ());
+
+            let a7 = uctx.sysno();
             axtask::with_current_task(&vti.task, || {
                 handle_syscall(&mut uctx);
             });
+
+            // Restore vsched2 CURRENT_TASK so the trap_handler can resume
+            starry_core::vsched::set_current_task_ptr(saved_task);
 
             drop(scope_guard);
             scope_local::ActiveScope::set_global();
@@ -406,12 +417,16 @@ fn vsched_trap_dispatcher(trapped_task: *const VschedTaskImpl) {
             let tf_mut = unsafe { &mut *(tf_ptr as *mut UserTrapFrame) };
             let new_ip = uctx.ip();
             let new_sp = uctx.regs.sp;
+
+            if a7 == 221 {
+                axlog::ax_println!(
+                    "[execve] TF: sepc={:#x} sp={:#x} a0={} tp={:#x} pid={}",
+                    new_ip, new_sp, uctx.arg0(), uctx.regs.tp,
+                    vti.pid.load(Ordering::Acquire),
+                );
+            }
             // Detect kernel address leakage into user sepc
             if new_ip >= 0xffffffc000000000 {
-                axlog::ax_println!(
-                    "[ECALL CORRUPT] a7={} old_sepc={:#x} new_sepc={:#x} new_sp={:#x} ret={}",
-                    a7, tf_mut.sepc, new_ip, new_sp, uctx.arg0(),
-                );
             }
             tf_mut.regs.a0 = uctx.arg0();  // return value
             tf_mut.regs.a1 = uctx.arg1();

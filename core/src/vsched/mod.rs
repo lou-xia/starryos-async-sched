@@ -6,7 +6,7 @@ use alloc::{
 };
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use axhal::{asm, mem::phys_to_virt};
+use axhal::asm;
 use axmm;
 use axtask::TaskState as AxTaskState;
 use libvsched2::{self, Stack as _};
@@ -144,23 +144,29 @@ pub fn push_task_to_kernel(task_ptr: *const ()) {
 }
 
 pub fn process_init(vspace_ptr: *mut *mut ()) -> usize {
-    // libvsched2::process_init(vspace_ptr)
-    axlog::ax_println!("[diag] process_init: ENTER vspace_ptr={:#x}", vspace_ptr as usize);
-    let pid = libvsched2::process_init(vspace_ptr);
-    axlog::ax_println!("[diag] process_init: RETURN pid={}", pid);
-    pid
+    libvsched2::process_init(vspace_ptr)
+}
+
+pub fn process_reinit(vspace_ptr: *mut *mut (), pid: usize) {
+    libvsched2::process_reinit(vspace_ptr, pid);
+}
+
+pub fn user_init_with_vspace(vspace: *mut ()) {
+    libvsched2::user_init_with_vspace(vspace);
 }
 
 pub fn user_init() {
     libvsched2::user_init()
 }
 
-pub fn user_init_with_vspace(vspace: *mut ()) {
-    libvsched2::user_init_with_vspace(vspace)
-}
-
 pub fn push_task_into_process(task: *const (), pid: usize) -> bool {
     libvsched2::push_task_into_process(task, pid)
+}
+
+/// 为子进程重新映射 vDSO/VVAR。等效于 load_user_app 中的 map_so 调用，
+/// 给子进程分配独立的 .data/.bss 物理页（.bss 为全零）。
+pub fn map_vdso_for_child(vspace: *mut ()) -> usize {
+    vdso::map_so(vspace as usize) as usize
 }
 
 /// 读取 vsched2 的当前任务指针 (CURRENT_TASK in VVAR)。
@@ -179,6 +185,13 @@ pub fn alloc_stack() -> *mut () {
     stack::VschedStackImpl::alloc()
 }
 
+/// 标记 vsched2 任务为 Exited，让 trap_handler 不再将其推回调度器
+pub fn set_vsched_task_exited(task: *const ()) {
+    let vti = unsafe { &*(task as *const task::VschedTaskImpl) };
+    use libvsched2::Task;
+    vti.set_state(libvsched2::TaskState::Exited);
+}
+
 pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace_ptr: Option<*mut *mut ()>) -> ! {
     axhal::asm::disable_irqs();
     init_vsched2_interfaces();
@@ -189,6 +202,10 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace_ptr: Option<*m
         fn vsched_yield_trampoline() -> !;
     }
     axtask::register_vsched2_yield(vsched_yield_trampoline);
+
+    // Initialize empty AxRunQueue so legacy code paths (AxWaker, timer
+    // tick, etc.) that deref it under vsched2 don't LazyInit-panic.
+    axtask::init_run_queue_empty();
 
     let curr = axtask::current();
     let main_ptr = register_task(curr.clone(), LOWEST_PRIORITY, 0, None);
@@ -217,6 +234,38 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace_ptr: Option<*m
                 let mut user_aspace = unsafe { &mut *(aspace_ptr as *mut axmm::AddrSpace) };
                 let kernel_aspace = axmm::kernel_aspace().lock();
                 let _ = user_aspace.copy_mappings_from(&kernel_aspace);
+
+                // Fill the vDSO reserved gap so mmap won't allocate here
+                let vdso_base = user_aspace.vdso_base;
+                axlog::ax_println!("[vsched2] ext vdso_base={:#x} vdso_size={:#x}",
+                    vdso_base, unsafe { vdso::VDSO_SIZE });
+                if vdso_base != 0 {
+                    let vdso_size = unsafe { vdso::VDSO_SIZE };
+                    let vdso_end = vdso_base + vdso_size;
+                    let highest = user_aspace.areas()
+                        .filter(|a| a.start().as_usize() >= vdso_base
+                                && a.end().as_usize() <= vdso_end)
+                        .map(|a| a.end().as_usize())
+                        .max()
+                        .unwrap_or(vdso_base);
+                    axlog::ax_println!("[vsched2] ext highest={:#x} vdso_end={:#x}", highest, vdso_end);
+                    if highest < vdso_end {
+                        let gap = vdso_end - highest;
+                        user_aspace.map(
+                            memory_addr::VirtAddr::from(highest),
+                            gap,
+                            axhal::paging::MappingFlags::READ
+                                | axhal::paging::MappingFlags::WRITE
+                                | axhal::paging::MappingFlags::USER,
+                            false,
+                            axmm::backend::Backend::new_alloc(
+                                memory_addr::VirtAddr::from(highest),
+                                axhal::paging::PageSize::Size4K,
+                            ),
+                        ).expect("vsched2: extend vdso reserved failed");
+                        axlog::ax_println!("[vsched2] extended vdso reserved: {:#x}-{:#x} gap={:#x}", highest, vdso_end, gap);
+                    }
+                }
             }
             if root.as_usize() != 0 && root != kernel_root {
                 unsafe {

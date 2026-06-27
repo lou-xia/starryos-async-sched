@@ -45,7 +45,11 @@ impl Wake for AxWaker {
     fn wake_by_ref(self: &Arc<Self>) {
         if let Some(task) = self.task.upgrade() {
             *self.woke.lock() = true;
-            select_run_queue::<NoPreemptIrqSave>(&task).unblock_task(task, false);
+            // Under vsched2, the AxRunQueue is dormant. Just mark the task
+            // as woken — the block_on loop will see it on next poll.
+            if !crate::api::vsched2_active() {
+                select_run_queue::<NoPreemptIrqSave>(&task).unblock_task(task, false);
+            }
         }
     }
 }

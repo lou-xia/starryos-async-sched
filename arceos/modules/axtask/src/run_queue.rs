@@ -664,6 +664,18 @@ pub(crate) fn init() {
     }
 }
 
+/// Init the run queue with `call_once` (idempotent, no panic on 2nd call).
+/// Used by vsched2 to ensure the queue exists even though vsched2 doesn't use it.
+pub(crate) fn init_empty() {
+    let cpu_id = this_cpu_id();
+    RUN_QUEUE.with_current(|rq| {
+        rq.call_once(|| AxRunQueue::new(cpu_id));
+    });
+    unsafe {
+        RUN_QUEUES[cpu_id].write(RUN_QUEUE.current_ref_mut_raw());
+    }
+}
+
 pub(crate) fn init_secondary() {
     let cpu_id = this_cpu_id();
 

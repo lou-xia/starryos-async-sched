@@ -344,17 +344,46 @@ pub fn load_user_app(
     // warn!("vdso mapped at: {:#x}", vdso_start.as_usize());
 
     crate::vsched::context::set_process_vdso_base(vdso_start.as_usize());
+    uspace.vdso_base = vdso_start.as_usize();
+
+    // Extend vDSO writable area to cover full VDSO_SIZE reserved space.
+    // This prevents musl mmap from allocating in the vDSO reserved gap.
+    {
+        let vdso_size = unsafe { vdso::VDSO_SIZE };
+        let vdso_reserved_end = vdso_start.as_usize() + vdso_size;
+        let highest = uspace
+            .areas()
+            .filter(|a| a.start().as_usize() >= vdso_start.as_usize())
+            .map(|a| a.end().as_usize())
+            .max()
+            .unwrap_or(vdso_start.as_usize());
+        if highest < vdso_reserved_end {
+            let gap = vdso_reserved_end - highest;
+            uspace.map(
+                VirtAddr::from(highest),
+                gap,
+                MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER,
+                true,
+                Backend::new_alloc(VirtAddr::from(highest), PageSize::Size4K),
+            )?;
+            axlog::ax_println!("[vdso] extended reserved: {:#x}-{:#x} gap={:#x}", highest, vdso_reserved_end, gap);
+        }
+    }
 
     // Pre-populate VDSO BSS areas (new_alloc backend) to avoid page faults
     {
         let areas_info: Vec<_> = uspace.areas().map(|a| (a.start(), a.end(), a.flags())).collect();
-        for (start, end, flags) in areas_info {
-            let mut vaddr = start;
-            while vaddr < end {
-                let _ = uspace.handle_page_fault(vaddr, flags);
+        let snapshot = areas_info.len();
+        let before = uspace.areas().count();
+        for (start, end, flags) in &areas_info {
+            let mut vaddr = *start;
+            while vaddr < *end {
+                let _ = uspace.handle_page_fault(vaddr, *flags);
                 vaddr += memory_addr::PAGE_SIZE_4K;
             }
         }
+        let after = uspace.areas().count();
+        axlog::ax_println!("[diag] pre-pop: areas {} → {} (snap={})", before, after, snapshot);
     }
 
     auxv.push(AuxEntry::new(AuxType::SYSINFO_EHDR, vdso_start.into()));

@@ -61,7 +61,7 @@ impl WaitPid {
 
 pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32) -> AxResult<isize> {
     let options = WaitOptions::from_bits_truncate(options);
-    info!("sys_waitpid <= pid: {pid:?}, options: {options:?}");
+    axlog::ax_println!("[wait] pid={} options={:?}", pid, options);
 
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
@@ -104,6 +104,7 @@ pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32) -> AxResult<isiz
         }
     };
 
+    axlog::ax_println!("[wait] blocking...");
     block_on(interruptible(poll_fn(|cx| {
         match check_children().transpose() {
             Some(res) => Poll::Ready(res),

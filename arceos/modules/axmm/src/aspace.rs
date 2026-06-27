@@ -20,6 +20,8 @@ pub struct AddrSpace {
     va_range: VirtAddrRange,
     areas: MemorySet<Backend>,
     pt: PageTable,
+    /// vDSO 在此地址空间中的虚拟基址。进程创建时设置。
+    pub vdso_base: usize,
 }
 
 impl AddrSpace {
@@ -64,6 +66,7 @@ impl AddrSpace {
             va_range: VirtAddrRange::from_start_size(base, size),
             areas: MemorySet::new(),
             pt: PageTable::try_new().map_err(|_| AxError::NoMemory)?,
+            vdso_base: 0,
         })
     }
 
