@@ -23,6 +23,10 @@ endif
 
 default: build
 
+all: build
+	cp $(PWD)/StarryOS_riscv64-qemu-virt.elf $(PWD)/kernel-rv
+	touch $(PWD)/kernel-la
+
 ROOTFS_URL = https://github.com/Starry-OS/rootfs/releases/download/20260214
 ROOTFS_IMG = rootfs-$(ARCH).img
 

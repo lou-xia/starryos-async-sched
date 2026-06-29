@@ -140,12 +140,24 @@ fn main() {
         .map(str::to_owned)
         .collect::<Vec<_>>();
     let envs: &[String] = &[];
-    axlog::ax_println!("main: USE_VSCHED2={} args={:?}", USE_VSCHED2, args);
+    // axlog::ax_println!("main: USE_VSCHED2={} args={:?}", USE_VSCHED2, args);
 
     if USE_VSCHED2 {
         let (init_ptr, vspace_ptr) = create_vsched_init_task(&args, envs);
         starry_core::vsched::vsched2_bootstrap(Some(init_ptr as *const ()), Some(vspace_ptr));
     } else {
         entry::run_initproc(&args, envs);
+    }
+
+    // SBI shutdown (SRST extension)
+    unsafe {
+        core::arch::asm!(
+            "li a7, 0x53525354",
+            "li a6, 0",
+            "li a0, 0",
+            "li a1, 0",
+            "ecall",
+            options(noreturn),
+        );
     }
 }
