@@ -8,6 +8,8 @@ extern crate axlog;
 extern crate alloc;
 extern crate axruntime;
 
+mod entry;
+
 use alloc::{
     borrow::ToOwned,
     boxed::Box,
@@ -21,6 +23,7 @@ use axhal::uspace::UserContext;
 use axsync::Mutex;
 use axtask::AxTaskExt;
 use starry_api::{file::FD_TABLE, task::new_user_task, vfs::dev::tty::N_TTY};
+#[allow(unused_imports)]
 use starry_core::{
     mm::{copy_from_kernel, load_user_app, new_user_aspace_empty},
     task::{ProcessData, Thread, add_task_to_table},
@@ -28,6 +31,8 @@ use starry_core::{
 };
 use starry_core::vsched::trapframe::{UserTrapFrame, UserTrapFrameKind};
 use starry_process::{Pid, Process};
+
+const USE_VSCHED2: bool = false;
 
 pub const CMDLINE: &[&str] = &["/bin/sh", "-c", include_str!("init.sh")];
 
@@ -134,9 +139,13 @@ fn main() {
         .copied()
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    let envs = [];
-    axlog::ax_println!("main: args={:?}", args);
-    let (init_ptr, vspace_ptr) = create_vsched_init_task(&args, &envs);
+    let envs: &[String] = &[];
+    axlog::ax_println!("main: USE_VSCHED2={} args={:?}", USE_VSCHED2, args);
 
-    starry_core::vsched::vsched2_bootstrap(Some(init_ptr as *const ()), Some(vspace_ptr));
+    if USE_VSCHED2 {
+        let (init_ptr, vspace_ptr) = create_vsched_init_task(&args, envs);
+        starry_core::vsched::vsched2_bootstrap(Some(init_ptr as *const ()), Some(vspace_ptr));
+    } else {
+        entry::run_initproc(&args, envs);
+    }
 }

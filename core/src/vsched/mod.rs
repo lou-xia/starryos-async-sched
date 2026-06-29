@@ -127,12 +127,7 @@ pub fn activate_vsched_trap_vector() {
             "csrr {}, sie",
             "csrr {}, sstatus",
             out(reg) stvec_val, out(reg) sie_val, out(reg) sstatus_val,
-        );
-        axlog::ax_println!(
-            "vsched2: stvec={:#x} sie={:#x} sstatus={:#x}",
-            stvec_val,
-            sie_val,
-            sstatus_val
+// axlog::ax_println!(
         );
         core::arch::asm!("csrw sscratch, {}", in(reg) stack_top);
         axhal::asm::write_trap_vector_base(vsched2_trap_vector as *const () as usize);
@@ -175,8 +170,8 @@ pub fn current_task_ptr() -> *const () {
 }
 
 /// 设置 vsched2 的当前任务指针 (CURRENT_TASK in VVAR)。
+// axlog::ax_println!("[vsched::set_current] task={:#x}", task as usize);
 pub fn set_current_task_ptr(task: *const ()) {
-    axlog::ax_println!("[vsched::set_current] task={:#x}", task as usize);
     libvsched2::set_current_task_ptr(task);
 }
 
@@ -219,8 +214,8 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace_ptr: Option<*m
         libvsched2::VDSO_VTABLE
             .kernel_init_main
             .expect("kernel_init_main not in vtable")(init_stack_ptr, main_ptr as *const ());
+// axlog::ax_println!("vsched2: kernel_init_main done");
     }
-    axlog::ax_println!("vsched2: kernel_init_main done");
 
     if let (Some(init_task_ptr), Some(vspace_ptr)) = (init_task_ptr, vspace_ptr) {
         let kernel_root = unsafe { asm::read_user_page_table() };
@@ -236,9 +231,8 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace_ptr: Option<*m
                 let _ = user_aspace.copy_mappings_from(&kernel_aspace);
 
                 // Fill the vDSO reserved gap so mmap won't allocate here
+// axlog::ax_println!("[vsched2] ext vdso_base={:#x} vdso_size={:#x}",
                 let vdso_base = user_aspace.vdso_base;
-                axlog::ax_println!("[vsched2] ext vdso_base={:#x} vdso_size={:#x}",
-                    vdso_base, unsafe { vdso::VDSO_SIZE });
                 if vdso_base != 0 {
                     let vdso_size = unsafe { vdso::VDSO_SIZE };
                     let vdso_end = vdso_base + vdso_size;
@@ -247,8 +241,8 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace_ptr: Option<*m
                                 && a.end().as_usize() <= vdso_end)
                         .map(|a| a.end().as_usize())
                         .max()
+// axlog::ax_println!("[vsched2] ext highest={:#x} vdso_end={:#x}", highest, vdso_end);
                         .unwrap_or(vdso_base);
-                    axlog::ax_println!("[vsched2] ext highest={:#x} vdso_end={:#x}", highest, vdso_end);
                     if highest < vdso_end {
                         let gap = vdso_end - highest;
                         user_aspace.map(
@@ -262,8 +256,8 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace_ptr: Option<*m
                                 memory_addr::VirtAddr::from(highest),
                                 axhal::paging::PageSize::Size4K,
                             ),
+// axlog::ax_println!("[vsched2] extended vdso reserved: {:#x}-{:#x} gap={:#x}", highest, vdso_end, gap);
                         ).expect("vsched2: extend vdso reserved failed");
-                        axlog::ax_println!("[vsched2] extended vdso reserved: {:#x}-{:#x} gap={:#x}", highest, vdso_end, gap);
                     }
                 }
             }
@@ -274,27 +268,19 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace_ptr: Option<*m
                     core::arch::asm!("csrs sstatus, {}", in(reg) 1usize << 18);
                 }
             }
+// axlog::ax_println!("vsched2: calling process_init...");
         }
-        axlog::ax_println!("vsched2: calling process_init...");
+// axlog::ax_println!("vsched2: process_init pid={}", pid);
         let pid = libvsched2::process_init(vspace_ptr);
-        axlog::ax_println!("vsched2: process_init pid={}", pid);
+// axlog::ax_println!("[verify] vdso_pa={:#x} user_vdso_base={:#x}",
         // --- Verification ---
-        axlog::ax_println!("[verify] vdso_pa={:#x} user_vdso_base={:#x}",
-            unsafe { VSCHED2_VDSO_START_PA },
-            crate::vsched::context::get_process_vdso_base());
-        axlog::ax_println!("vsched2: calling user_init_with_vspace...");
         // user_init must run with the user PT active so that &USER_SCHEDULER
         // inside init_sources resolves to the user vDSO copy.  We call
         // user_init_with_vspace which translates the address to kva.
         let aspace_ptr = unsafe { *vspace_ptr };
         libvsched2::user_init_with_vspace(aspace_ptr);
-        axlog::ax_println!("vsched2: user_init done");
-        let pushed = libvsched2::push_task_into_process(init_task_ptr, pid);
-        axlog::ax_println!(
-            "vsched2: push_task_into_process pid={} result={}",
-            pid,
-            pushed
-        );
+// axlog::ax_println!("vsched2: user_init done");
+        libvsched2::push_task_into_process(init_task_ptr, pid);
         unsafe {
             asm::write_user_page_table(kernel_root);
             asm::flush_tlb(None);
@@ -311,10 +297,10 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace_ptr: Option<*m
         }
     }
 
+// axlog::ax_println!("vsched2: trap vector active, entering scheduler");
     activate_vsched_trap_vector();
-    axlog::ax_println!("vsched2: trap vector active, entering scheduler");
+// axlog::ax_println!("vsched2: entering yield loop");
 
-    axlog::ax_println!("vsched2: entering yield loop");
     loop {
         unsafe {
             core::arch::asm!("call vsched_yield_trampoline");

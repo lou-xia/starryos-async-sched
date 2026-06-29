@@ -22,10 +22,10 @@ pub fn sys_brk(addr: usize) -> AxResult<isize> {
         return Ok(current_top as isize);
     }
 
-    axlog::ax_println!("[brk] addr={:#x} current_top={:#x} expand_start={:#x} expand_size={:#x}",
-        addr, current_top,
-        align_up_4k(current_top as usize),
-        align_up_4k(addr).saturating_sub(align_up_4k(current_top as usize)));
+    // axlog::ax_println!("[brk] addr={:#x} current_top={:#x} expand_start={:#x} expand_size={:#x}",
+    //     addr, current_top,
+    //     align_up_4k(current_top as usize),
+    //     align_up_4k(addr).saturating_sub(align_up_4k(current_top as usize)));
 
     let new_top_aligned = align_up_4k(addr);
     let current_top_aligned = align_up_4k(current_top);

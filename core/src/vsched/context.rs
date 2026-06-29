@@ -143,21 +143,13 @@ impl libvsched2::Context for VschedContextImpl {
         let vsched_task = unsafe { &*(task as *const VschedTaskImpl) };
         let tf_ptr = vsched_task.trap_frame.load(Ordering::Acquire);
         assert_ne!(tf_ptr, 0, "into_user_context: trap_frame is null");
+// axlog::ax_println!(
         let tf = unsafe { &*(tf_ptr as *const UserTrapFrame) };
-        axlog::ax_println!(
-            "[into_user_ctx] task={} pid={} tf={:#x} sepc={:#x} sp={:#x} tp={:#x} a0={:#x}",
-            vsched_task.task.id_name(),
-            vsched_task.pid.load(Ordering::Acquire),
-            tf_ptr, tf.sepc, tf.regs.sp, tf.regs.tp, tf.regs.a0,
-        );
         // ABORT only if going back to U-mode (SPP=0) with kernel sepc.
         // Yield from S-mode saves SPP=1 with kernel sepc — that's correct.
         let spp = (tf.sstatus >> 8) & 1;
+// axlog::ax_println!(
         if spp == 0 && tf.sepc >= 0xffffffc000000000 {
-            axlog::ax_println!(
-                "[into_user_ctx] ABORT! kernel sepc={:#x}, NOT dispatching",
-                tf.sepc,
-            );
             loop { core::hint::spin_loop(); }
         }
         // into_vspace already switched SATP to user PT. Load regs and sret.

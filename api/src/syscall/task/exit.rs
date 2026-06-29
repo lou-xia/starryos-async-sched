@@ -1,4 +1,5 @@
 use axerrno::AxResult;
+use axtask::vsched2_active;
 
 use crate::task::do_exit;
 
@@ -15,6 +16,9 @@ pub fn sys_exit_group(exit_code: i32) -> AxResult<isize> {
 }
 
 fn mark_exited() {
+    if !axtask::vsched2_active() {
+        return;
+    }
     let task = starry_core::vsched::current_task_ptr();
     if !task.is_null() {
         unsafe { starry_core::vsched::set_vsched_task_exited(task); }

@@ -230,8 +230,8 @@ pub fn sys_clone(
         *new_task.task_ext_mut() = Some(unsafe { AxTaskExt::from_impl(thr) });
         let (task, vti_ptr) = crate::task::new_vsched_user_task(new_task, &new_uctx);
 
+// axlog::ax_println!("[clone] calling process_init for child pid={}", tid);
         if !flags.contains(CloneFlags::THREAD) {
-            axlog::ax_println!("[clone] calling process_init for child pid={}", tid);
             let thr = task.try_as_thread().expect("vsched2 child must have thread");
             let saved_root = axhal::asm::read_user_page_table();
             let (child_root, vspace_ptr): (_, *mut *mut ()) = {
@@ -249,11 +249,8 @@ pub fn sys_clone(
             // (identical to load_user_app creation).
             if !flags.contains(CloneFlags::VM) {
                 let user_vdso_base =
+// axlog::ax_println!(
                     starry_core::vsched::context::get_process_vdso_base();
-                axlog::ax_println!(
-                    "[clone] parent vdso_base={:#x} re-mapping vdso for child",
-                    user_vdso_base,
-                );
                 let vvar_size =
                     unsafe { starry_core::vsched::VSCHED2_VVAR_SIZE };
                 let vdso_size =
@@ -313,19 +310,13 @@ pub fn sys_clone(
                 }
             }
 
+// axlog::ax_println!(
             let child_pid = starry_core::vsched::process_init(vspace_ptr);
-            axlog::ax_println!(
-                "[clone] process_init returned pid={}",
-                child_pid,
-            );
             unsafe { &*(vti_ptr as *const starry_core::vsched::VschedTaskImpl) }
                 .pid.store(child_pid, Ordering::Release);
             starry_core::vsched::user_init_with_vspace(unsafe { *vspace_ptr });
-            let pushed = starry_core::vsched::push_task_into_process(vti_ptr, child_pid);
-            axlog::ax_println!(
-                "[clone] push_task pid={} result={}, clone done",
-                child_pid, pushed,
-            );
+// axlog::ax_println!(
+            starry_core::vsched::push_task_into_process(vti_ptr, child_pid);
         }
 
         add_task_to_table(&task);

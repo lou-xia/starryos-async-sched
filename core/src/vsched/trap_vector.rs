@@ -168,28 +168,14 @@ extern "C" fn vsched2_trap_entry_stub(
     let idx = trap_n & 3;
     unsafe { core::ptr::copy_nonoverlapping(tf_stack, &raw mut TF_POOL[idx], 1) };
     let tf_ptr = unsafe { &raw mut TF_POOL[idx] as *mut UserTrapFrame };
-
-    if trap_n < 200 {
-        let tf = unsafe { &*tf_stack };
-        let cur_sscratch: usize;
-        unsafe { core::arch::asm!("csrr {}, sscratch", out(reg) cur_sscratch); }
-        axlog::ax_println!(
-            "[trap#{}] scause={:#x} sepc={:#x} stval={:#x} sscratch={:#x}",
-            trap_n, tf.scause, tf.sepc, tf.stval, cur_sscratch,
-        );
-    }
+// axlog::ax_println!(
 
     let mut task_ptr = task_ptr;
     if task_ptr.is_null() { task_ptr = libvsched2::current_task_ptr(); }
     if !task_ptr.is_null() {
         let vti = unsafe { &*(task_ptr as *const VschedTaskImpl) };
-        let old_tf = vti.trap_frame.load(core::sync::atomic::Ordering::Relaxed);
+// axlog::ax_println!(
         vti.trap_frame.store(tf_ptr as usize, core::sync::atomic::Ordering::Release);
-        axlog::ax_println!(
-            "[trap_stub] task={} pid={} trap#{} old_tf={:#x} new_tf={:#x}",
-            vti.task.id_name(), vti.pid.load(core::sync::atomic::Ordering::Relaxed),
-            trap_n, old_tf, tf_ptr as usize,
-        );
     }
 
     let entry = unsafe {
@@ -238,21 +224,8 @@ extern "C" fn vsched_yield_entry_stub(tf_stack: *const UserTrapFrame) -> ! {
     let current_task = libvsched2::current_task_ptr();
     if !current_task.is_null() {
         let vti = unsafe { &*(current_task as *const VschedTaskImpl) };
-        let old_tf = vti.trap_frame.load(core::sync::atomic::Ordering::Relaxed);
+// axlog::ax_println!(
         vti.trap_frame.store(tf_ptr as usize, core::sync::atomic::Ordering::Release);
-        axlog::ax_println!(
-            "[yield_stub] task={} pid={} old_tf={:#x} new_tf={:#x} (heap Box)",
-            vti.task.id_name(), vti.pid.load(core::sync::atomic::Ordering::Relaxed),
-            old_tf, tf_ptr as usize,
-        );
-        // Detect: handler coroutine yielding but CURRENT_TASK is the user task
-        if vti.pid.load(core::sync::atomic::Ordering::Relaxed) != 0 {
-            axlog::ax_println!(
-                "[yield_stub] WARNING: non-kernel task yielding! pid={} name={}",
-                vti.pid.load(core::sync::atomic::Ordering::Relaxed),
-                vti.task.id_name(),
-            );
-        }
     }
 
     let entry = unsafe {

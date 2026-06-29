@@ -132,10 +132,12 @@ pub fn init_scheduler_secondary() {
 ///
 /// If vsched2 is active, timer is handled by vsched2's trap entry; skip
 /// legacy AxRunQueue path entirely to avoid LazyInit panic.
+#[cfg(feature = "irq")]
 pub fn on_timer_tick() {
     if vsched2_active() {
         return;
     }
+    crate::timers::check_events();
     current_run_queue::<kernel_guard::NoOp>().scheduler_timer_tick();
 }
 
@@ -280,7 +282,6 @@ pub fn yield_now() {
         let f: unsafe extern "C" fn() -> ! = unsafe { core::mem::transmute(f) };
         unsafe { f() };
     } else {
-        log::warn!("[yield] VSCHED2_YIELD=0, falling back!");
         current_run_queue::<NoPreemptIrqSave>().yield_current()
     }
 }

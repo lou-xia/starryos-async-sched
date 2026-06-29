@@ -113,15 +113,8 @@ impl libvsched2::Task for VschedTaskImpl {
     fn restore_context(&self) {
         let tf_ptr = self.trap_frame.load(Ordering::Acquire);
         assert_ne!(tf_ptr, 0, "restore_context: trap_frame is null");
+// axlog::ax_println!(
         let tf = unsafe { &*(tf_ptr as *const UserTrapFrame) };
-        axlog::ax_println!(
-            "[restore_ctx] pid={} kind={} sepc={:#x} sp={:#x} sstatus={:#x}",
-            self.pid.load(Ordering::Acquire),
-            tf.kind as usize,
-            tf.sepc,
-            tf.regs.sp,
-            tf.sstatus,
-        );
         unsafe { tf.restore_and_jump() };
     }
 

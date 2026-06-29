@@ -5,7 +5,7 @@ use core::{
 
 use axerrno::{AxError, AxResult};
 use axhal::uspace::{ExceptionKind, ReturnReason, UserContext};
-use axtask::{AxTaskRef, TaskInner, TaskState as AxTaskState, current, spawn_task};
+use axtask::{AxTaskRef, TaskInner, TaskState as AxTaskState, current, spawn_task, vsched2_active};
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::general::ROBUST_LIST_LIMIT;
 use ringbuf::Arc;
@@ -228,7 +228,9 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
         if let Some(futex) = guard {
             futex.wq.wake(1, u32::MAX);
         }
-        axtask::yield_now();
+        if !vsched2_active() {
+            axtask::yield_now();
+        }
     }
     let head = thr.robust_list_head() as *const RobustListHead;
     if !head.is_null()
@@ -340,32 +342,10 @@ fn vsched_trap_dispatcher(trapped_task: *const VschedTaskImpl) {
 
     match tf.scause {
         // Timer interrupt: handled by stub (stimecmp reset), just ignore here
-        sc if sc >> 63 == 1 => {
-            static TIMER_CNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-            let n = TIMER_CNT.fetch_add(1, Ordering::Relaxed);
-            if n < 5 { axlog::ax_println!("[stats] timer={}", n+1); }
-        }
+// if n < 5 { axlog::ax_println!("[stats] timer={}", n+1); }
+        sc if sc >> 63 == 1 => {}
+// axlog::ax_println!("[ecall#{}] a7={} a0={:#x} a1={:#x} a2={}", n, a7, tf.regs.a0, tf.regs.a1, tf.regs.a2);
           8 => {
-            static ECALL_CNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-            let n = ECALL_CNT.fetch_add(1, Ordering::Relaxed);
-            // Log first 30 and key syscalls: write(64), exit(93), exit_group(94), openat(56), read(63), dup(23)
-            let a7 = tf.regs.a7;
-            let is_key = a7 == 64 || a7 == 93 || a7 == 94 || a7 == 56 || a7 == 63 || a7 == 23;
-            if n < 200 || is_key {
-                axlog::ax_println!("[ecall#{}] a7={} a0={:#x} a1={:#x} a2={}", n, a7, tf.regs.a0, tf.regs.a1, tf.regs.a2);
-            }
-            // Periodically dump counts of last-seen syscalls
-            static LAST_A7: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-            static A7_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-            let prev = LAST_A7.load(Ordering::Relaxed);
-            if prev == a7 as usize {
-                A7_COUNT.fetch_add(1, Ordering::Relaxed);
-            }
-            LAST_A7.store(a7 as usize, Ordering::Relaxed);
-            if n > 0 && n % 50 == 0 {
-                axlog::ax_println!("[ecall#{}] total_ecalls={} last_a7={} repeat={}", n, n, a7,
-                    A7_COUNT.swap(0, Ordering::Relaxed));
-            }
             let mut uctx = UserContext::new(
                 tf.sepc + 4,
                 VirtAddr::from(tf.regs.sp),
@@ -417,50 +397,17 @@ fn vsched_trap_dispatcher(trapped_task: *const VschedTaskImpl) {
             let tf_mut = unsafe { &mut *(tf_ptr as *mut UserTrapFrame) };
             let new_ip = uctx.ip();
             let new_sp = uctx.regs.sp;
+// axlog::ax_println!(
 
-            if a7 == 221 {
-                axlog::ax_println!(
-                    "[execve] TF: sepc={:#x} sp={:#x} a0={} tp={:#x} pid={}",
-                    new_ip, new_sp, uctx.arg0(), uctx.regs.tp,
-                    vti.pid.load(Ordering::Acquire),
-                );
-            }
-            // Detect kernel address leakage into user sepc
-            if new_ip >= 0xffffffc000000000 {
-            }
             tf_mut.regs.a0 = uctx.arg0();  // return value
             tf_mut.regs.a1 = uctx.arg1();
             tf_mut.regs.sp = new_sp;
             tf_mut.sepc = new_ip;
+// axlog::ax_println!("[write] fd={} len={} ret={}", tf.regs.a0, tf.regs.a2, tf_mut.regs.a0);
             tf_mut.sstatus = uctx.sstatus.bits();
-            if a7 == 64 {
-                axlog::ax_println!("[write] fd={} len={} ret={}", tf.regs.a0, tf.regs.a2, tf_mut.regs.a0);
-            } else {
-                axlog::ax_println!("[ecall] ret a0={} new_sepc={:#x}", tf_mut.regs.a0, tf_mut.sepc);
-            }
         }
-         12 | 13 | 15 => {
-            static PF_CNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-            let n = PF_CNT.fetch_add(1, Ordering::Relaxed);
-            let log_detail = n < 3;
-            if log_detail { axlog::ax_println!("[pf] ENTER vaddr={:#x} scause={}", tf.stval, tf.scause); }
-            // Dump all GPRs when faulting on a kernel address to find the leaking register
-            if tf.stval >= 0xffffffc000000000 && n < 5 {
-                axlog::ax_println!("[pf] REGS: ra={:#x} sp={:#x} gp={:#x} tp={:#x}",
-                    tf.regs.ra, tf.regs.sp, tf.regs.gp, tf.regs.tp);
-                axlog::ax_println!("[pf] REGS: t0={:#x} t1={:#x} t2={:#x}",
-                    tf.regs.t0, tf.regs.t1, tf.regs.t2);
-                axlog::ax_println!("[pf] REGS: a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
-                    tf.regs.a0, tf.regs.a1, tf.regs.a2, tf.regs.a3, tf.regs.a4, tf.regs.a5);
-                axlog::ax_println!("[pf] REGS: s0={:#x} s1={:#x}",
-                    tf.regs.s0, tf.regs.s1);
-                axlog::ax_println!("[pf] REGS: s2={:#x} s3={:#x} s4={:#x} s5={:#x}",
-                    tf.regs.s2, tf.regs.s3, tf.regs.s4, tf.regs.s5);
-                axlog::ax_println!("[pf] REGS: s6={:#x} s7={:#x} s8={:#x} s9={:#x} s10={:#x} s11={:#x}",
-                    tf.regs.s6, tf.regs.s7, tf.regs.s8, tf.regs.s9, tf.regs.s10, tf.regs.s11);
-                axlog::ax_println!("[pf] REGS: t3={:#x} t4={:#x} t5={:#x} t6={:#x}",
-                    tf.regs.t3, tf.regs.t4, tf.regs.t5, tf.regs.t6);
-            }
+// if log_detail { axlog::ax_println!("[pf] ENTER vaddr={:#x} scause={}", tf.stval, tf.scause); }
+          12 | 13 | 15 => {
             let vaddr = VirtAddr::from(tf.stval);
             let flags = match tf.scause {
                 12 => MappingFlags::EXECUTE | MappingFlags::USER,
@@ -468,22 +415,15 @@ fn vsched_trap_dispatcher(trapped_task: *const VschedTaskImpl) {
         _ => MappingFlags::WRITE | MappingFlags::USER,
             };
             // Try trapped task first, then fall back to axtask::current()
+// if log_detail { axlog::ax_println!("[pf] try_as_thread: vti={}", vti.task.try_as_thread().is_some()); }
             let mut fixed = {
-                if log_detail { axlog::ax_println!("[pf] try_as_thread: vti={}", vti.task.try_as_thread().is_some()); }
                 if let Some(thr) = vti.task.try_as_thread() {
+// if log_detail { axlog::ax_println!("[pf] vaddr={:#x} PT query={:?}", vaddr.as_usize(), pt_result); }
                     let mut aspace = thr.proc_data.aspace.lock();
-                    let pt_result = aspace.page_table().query(vaddr);
-                    if log_detail { axlog::ax_println!("[pf] vaddr={:#x} PT query={:?}", vaddr.as_usize(), pt_result); }
-                    if log_detail {
-                        axlog::ax_println!("[pf] all areas:");
-                        for area in aspace.areas() {
-                            axlog::ax_println!("[pf] AREA {:#x}-{:#x}", area.start().as_usize(), area.end().as_usize());
-                        }
-                    }
                     aspace.handle_page_fault(vaddr, flags)
                 } else {
+// axlog::ax_println!("[pf] fallback: axcur has_thread={}", cur.try_as_thread().is_some());
                     let cur = axtask::current();
-                    axlog::ax_println!("[pf] fallback: axcur has_thread={}", cur.try_as_thread().is_some());
                     if let Some(thr) = cur.try_as_thread() {
                         let mut aspace = thr.proc_data.aspace.lock();
                         aspace.handle_page_fault(vaddr, flags)
@@ -508,15 +448,14 @@ fn vsched_trap_dispatcher(trapped_task: *const VschedTaskImpl) {
                         }
                     }
                 }
+// axlog::ax_println!("[pf] vaddr={:#x} fixed={} scause={}", tf.stval, fixed, tf.scause);
             };
-            axlog::ax_println!("[pf] vaddr={:#x} fixed={} scause={}", tf.stval, fixed, tf.scause);
             if !fixed {
                 raise_signal_fatal_for_task(&signal_task, SignalInfo::new_kernel(Signo::SIGSEGV)).ok();
             }
         }
+// axlog::ax_println!("[ecall] a7={} a0={} a1={:#x} a2={} sepc={:#x} sp={:#x}",
          8 => {
-            axlog::ax_println!("[ecall] a7={} a0={} a1={:#x} a2={} sepc={:#x} sp={:#x}",
-                tf.regs.a7, tf.regs.a0, tf.regs.a1, tf.regs.a2, tf.sepc, tf.regs.sp);
             let mut uctx = UserContext::new(
                 tf.sepc + 4,
                 VirtAddr::from(tf.regs.sp),
@@ -546,8 +485,8 @@ fn vsched_trap_dispatcher(trapped_task: *const VschedTaskImpl) {
             // a2-a5: keep original (not usually modified by kernel)
             // a6-a7: keep original
             tf_mut.sepc = uctx.ip();
+// axlog::ax_println!("[ecall] ret a0={} new_sepc={:#x}", tf_mut.regs.a0, tf_mut.sepc);
             tf_mut.sstatus = uctx.sstatus.bits();
-            axlog::ax_println!("[ecall] ret a0={} new_sepc={:#x}", tf_mut.regs.a0, tf_mut.sepc);
         }
         1 | 5 | 7 => {
             axlog::error!(

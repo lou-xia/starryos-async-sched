@@ -85,28 +85,28 @@ impl libvsched2::TrapInfo for VschedTrapInfoImpl {
         unsafe { drop(Box::from_raw(ptr)) };
     }
 
+// axlog::ax_println!("[new_handler] START queue={:#x}", queue as usize);
     fn new_handler(queue: *const ()) -> *const () {
-        axlog::ax_println!("[new_handler] START queue={:#x}", queue as usize);
         let handler_fn = unsafe {
             libvsched2::VDSO_VTABLE
                 .trap_handler
                 .expect("trap_handler not in vtable")
+// axlog::ax_println!("[new_handler] got handler_fn, creating task");
         };
-        axlog::ax_println!("[new_handler] got handler_fn, creating task");
         let task_ref = axtask::new_raw(
             || {},
             alloc::string::String::from("trap_handler"),
             config::KERNEL_STACK_SIZE,
+// axlog::ax_println!("[new_handler] axtask::new_raw done");
         );
-        axlog::ax_println!("[new_handler] axtask::new_raw done");
         task_ref.set_state(AxTaskState::Blocked);
         let coro = Arc::new(TrapHandlerCoroutine {
             handler_fn: AtomicUsize::new(handler_fn as usize),
             queue: AtomicUsize::new(queue as usize),
+// axlog::ax_println!("[new_handler] about to register_task");
         });
-        axlog::ax_println!("[new_handler] about to register_task");
+// axlog::ax_println!("[new_handler] DONE ptr={:#x}", ptr as usize);
         let ptr = register_task(task_ref, HIGHEST_PRIORITY, 0, Some(coro));
-        axlog::ax_println!("[new_handler] DONE ptr={:#x}", ptr as usize);
         ptr as *const ()
     }
 }
@@ -124,11 +124,11 @@ unsafe impl Sync for TrapHandlerCoroutine {}
 impl CoroutinePoll for TrapHandlerCoroutine {
     fn poll(&self) -> Poll<isize> {
         let handler_fn = self.handler_fn.load(Ordering::Acquire);
+// axlog::ax_println!("[handler::poll] handler_fn={:#x} queue={:#x}", handler_fn, queue);
         let queue = self.queue.load(Ordering::Acquire);
-        axlog::ax_println!("[handler::poll] handler_fn={:#x} queue={:#x}", handler_fn, queue);
         let handler: fn(*const ()) = unsafe { core::mem::transmute(handler_fn) };
+// axlog::ax_println!("[handler::poll] handler returned, writing P marker");
         handler(queue as *const ());
-        axlog::ax_println!("[handler::poll] handler returned, writing P marker");
         unsafe { core::ptr::write_volatile(0xffffffc010000000 as *mut u8, b'P'); }
         Poll::Pending
     }

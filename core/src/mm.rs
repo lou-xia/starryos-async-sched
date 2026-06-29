@@ -383,7 +383,7 @@ pub fn load_user_app(
             }
         }
         let after = uspace.areas().count();
-        axlog::ax_println!("[diag] pre-pop: areas {} → {} (snap={})", before, after, snapshot);
+        // axlog::ax_println!("[diag] pre-pop: areas {} → {} (snap={})", before, after, snapshot);
     }
 
     auxv.push(AuxEntry::new(AuxType::SYSINFO_EHDR, vdso_start.into()));
