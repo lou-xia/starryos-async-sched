@@ -1,0 +1,13 @@
+
+vdso_output/libvdsoexample.so:	file format elf64-littleriscv
+
+DYNAMIC SYMBOL TABLE:
+00000000000004c0 l    D  .text	0000000000000000 .text
+0000000000000618 g    DF .text	0000000000000026 set_shared
+000000000000065a g    DF .text	0000000000000064 test_call
+000000000000054a g    DF .text	00000000000000c0 init_vtable_TestIf
+00000000000004c0 g    DF .text	000000000000000c get_code_base
+000000000000060a g    DF .text	000000000000000e set_private
+000000000000052a g    DF .text	0000000000000020 get_shared
+000000000000051c g    DF .text	000000000000000e get_private
+000000000000063e g    DF .text	000000000000001c test_args

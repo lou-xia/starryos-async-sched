@@ -1,6 +1,25 @@
-use std::{fs, path::Path};
+use std::{fs, path::{Path, PathBuf}};
 
 use crate::BuildConfig;
+
+fn relative_path(from: &Path, to: &Path) -> PathBuf {
+    let from = fs::canonicalize(from).unwrap();
+    let to = fs::canonicalize(to).unwrap();
+    let mut from_comps = from.components().peekable();
+    let mut to_comps = to.components().peekable();
+    while from_comps.peek() == to_comps.peek() {
+        from_comps.next();
+        to_comps.next();
+    }
+    let mut result = PathBuf::new();
+    for _ in from_comps {
+        result.push("..");
+    }
+    for comp in to_comps {
+        result.push(comp);
+    }
+    result
+}
 
 pub(crate) fn gen_wrapper(config: &BuildConfig) {
     let lib_path = Path::new(&config.out_dir).join("vdso_wrapper");
@@ -18,7 +37,10 @@ fn cargo_toml_content(config: &BuildConfig) -> String {
     if !config.features.is_empty() {
         features = String::from("\"") + &features + "\"";
     }
-    let absolute_src_dir = fs::canonicalize(Path::new(&config.src_dir)).unwrap();
+    let out_dir = fs::canonicalize(Path::new(&config.out_dir)).unwrap();
+    let src_dir = fs::canonicalize(Path::new(&config.src_dir)).unwrap();
+    let wrapper_path = out_dir.join("vdso_wrapper");
+    let rel_path = relative_path(&wrapper_path, &src_dir);
     format!(
         r#"[package]
 name = "vdso_wrapper"
@@ -37,7 +59,7 @@ panic = "abort"
 {} = {{ path = "{}", features = [{}] }}
 "#,
         config.package_name,
-        absolute_src_dir.display(),
+        rel_path.display(),
         features
     )
 }

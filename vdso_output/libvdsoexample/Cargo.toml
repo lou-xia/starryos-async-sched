@@ -1,0 +1,17 @@
+[package]
+name = "libvdsoexample"
+edition = "2021"
+
+[dependencies]
+vdso_example = { path = "../../vdso_example" }
+log = { version = "0.4", optional = true }
+crate_interface = "0.2"
+page_table_entry = "0.5.7"
+include_bytes_aligned = "0.1.4"
+xmas-elf = "0.9.0"
+elf_parser = { git = "https://github.com/rosy233333/elf_parser.git" }
+lazyinit = "0.2"
+
+[features]
+log = ["dep:log"]
+default = []

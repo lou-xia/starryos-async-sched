@@ -1,0 +1,15 @@
+[package]
+name = "vdso_wrapper"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib"]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[dependencies]
+vsched2 = { path = "../../deps/vsched2", features = ["vdso_only"] }
