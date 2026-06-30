@@ -2611,7 +2611,17 @@ name = "vdso_example"
 version = "0.1.0"
 dependencies = [
  "lazyinit",
- "vdso_helper",
+ "vdso_helper 0.1.0 (git+https://github.com/rosy233333/vdso_crate_template)",
+]
+
+[[package]]
+name = "vdso_helper"
+version = "0.1.0"
+dependencies = [
+ "lazyinit",
+ "log",
+ "paste",
+ "vsched_hal",
 ]
 
 [[package]]
@@ -2620,7 +2630,6 @@ version = "0.1.0"
 source = "git+https://github.com/rosy233333/vdso_crate_template#ead7e15a508d36ccbe3a898cef19634c52d08b7b"
 dependencies = [
  "lazyinit",
- "log",
  "paste",
  "vsched_hal",
 ]
@@ -2674,7 +2683,7 @@ name = "vqueue"
 version = "0.1.0"
 dependencies = [
  "lazyinit",
- "vdso_helper",
+ "vdso_helper 0.1.0",
 ]
 
 [[package]]
@@ -2684,7 +2693,7 @@ dependencies = [
  "heapless 0.9.2",
  "lazyinit",
  "spin 0.10.0",
- "vdso_helper",
+ "vdso_helper 0.1.0",
 ]
 
 [[package]]
