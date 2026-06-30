@@ -9,7 +9,7 @@ crate_interface = "0.2"
 page_table_entry = "0.5.7"
 include_bytes_aligned = "0.1.4"
 xmas-elf = "0.9.0"
-elf_parser = { git = "https://github.com/rosy233333/elf_parser.git" }
+elf_parser = { path = "../../deps/elf_parser" }
 lazyinit = "0.2"
 
 [features]

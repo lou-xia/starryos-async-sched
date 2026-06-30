@@ -1,0 +1,16 @@
+[package]
+name = "elf_parser"
+version = "0.1.0"
+edition = "2021"
+authors = ["Youjie Zheng <zyj578335934@gmail.com>"]
+description = "A ELF parser to parse ELF information and convert it to memory segments."
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+keywords = ["Starry", "ELF"]
+
+[dependencies]
+axerrno = "0.2"
+page_table_entry = "0.5.7"
+xmas-elf = "0.9.0"
+memory_addr = "0.4"
+log = "0.4"
+cfg-if = "1.0"

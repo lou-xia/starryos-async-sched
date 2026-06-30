@@ -46,6 +46,8 @@ fn cargo_toml_content(config: &BuildConfig) -> String {
     let src_dir = fs::canonicalize(Path::new(&config.src_dir)).unwrap();
     let api_lib_path = out_dir.join(&config.api_lib_name);
     let rel_path = relative_path(&api_lib_path, &src_dir);
+    let elf_parser_path = out_dir.parent().unwrap().join("deps").join("elf_parser");
+    let elf_rel = relative_path(&api_lib_path, &elf_parser_path);
     format!(
         r#"[package]
 name = "{}"
@@ -58,7 +60,7 @@ crate_interface = "0.2"
 page_table_entry = "0.5.7"
 include_bytes_aligned = "0.1.4"
 xmas-elf = "0.9.0"
-elf_parser = {{ git = "https://github.com/rosy233333/elf_parser.git" }}
+elf_parser = {{ path = "{}" }}
 lazyinit = "0.2"
 
 [features]
@@ -67,7 +69,8 @@ default = []
 "#,
         config.api_lib_name,
         config.package_name,
-        rel_path.display()
+        rel_path.display(),
+        elf_rel.display()
     )
 }
 
