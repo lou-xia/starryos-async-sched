@@ -32,7 +32,7 @@ use starry_core::{
 use starry_core::vsched::trapframe::{UserTrapFrame, UserTrapFrameKind};
 use starry_process::{Pid, Process};
 
-const USE_VSCHED2: bool = false;
+const USE_VSCHED2: bool = true;
 
 pub const CMDLINE: &[&str] = &["/bin/sh", "-c", include_str!("init.sh")];
 

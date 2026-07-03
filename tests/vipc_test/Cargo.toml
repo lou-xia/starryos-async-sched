@@ -5,4 +5,4 @@ edition = "2024"
 
 [dependencies]
 libc = "0.2"
-vipc = { path = "../../deps/vipc", default-features = false, features = ["starry_vdso"] }
+vipc = { path = "/home/lou-xia/lou-xia/StarryOS/vipc/vipc", default-features = false, features = ["starry_vdso"] }

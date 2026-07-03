@@ -3,24 +3,18 @@
 export HOME=/root
 
 echo -e "Welcome to \e[96m\e[1mStarry OS\e[0m!"
+env
+echo
 
-SKIP_GROUPS="iperf netperf cyclictest ltp"
+echo -e "Use \e[1m\e[3mapk\e[0m to install packages."
+echo
 
-for script in /*_testcode.sh; do
-    [ -f "$script" ] || continue
-    group=$(basename "$script" _testcode.sh)
-    skip=0
-    for s in $SKIP_GROUPS; do
-        [ "$s" = "$group" ] && skip=1 && break
-    done
-    echo "#### OS COMP TEST GROUP START $group ####"
-    if [ $skip -eq 1 ]; then
-        echo "SKIPPED: $group (not supported)"
-    else
-        sh "$script" || true
-    fi
-    echo "#### OS COMP TEST GROUP END $group ####"
-done
+# Do your initialization here!
 
-echo "All tests completed."
-exit 0
+# cd /tests/target/riscv64gc-unknown-linux-musl/release/
+# ./hello_world
+# cd /
+# rm -rf /tests
+# exit
+cd ~
+sh --login

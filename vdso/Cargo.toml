@@ -15,4 +15,4 @@ axerrno.workspace = true
 axsync.workspace = true
 
 [build-dependencies]
-build_vdso = { path = "../deps/build_vdso" }
+build_vdso = { path = "../../vdso_crate_template/vdso_crate_template/build_vdso" }
