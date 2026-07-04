@@ -1,5 +1,5 @@
 use alloc::{boxed::Box, string::ToString, sync::Arc, vec::Vec};
-use core::{ffi::c_char, sync::atomic::Ordering};
+use core::ffi::c_char;
 
 use axerrno::{AxError, AxResult};
 use axfs::FS_CONTEXT;
@@ -59,14 +59,28 @@ pub fn sys_execve(
                 Box::into_raw(Box::new(p))
             };
 
-            // execve replaces the address space; re-init the vsched2 scheduler,
-            // re-using the existing pid (current_task_ptr() returns the trapped task).
+            // execve replaces the address space; re-init the vsched2 scheduler
+            // in the new vDSO. Switch PT to new AS, call user_init(), then
+            // restore kernel PT. vspace pointer in PROCESS_INFO_TABLE is
+            // updated by process_init; no separate reinit API exists.
             if vsched2_active() {
-                let task_ptr = starry_core::vsched::current_task_ptr();
-                let pid = unsafe { &*(task_ptr as *const starry_core::vsched::VschedTaskImpl) }
-                    .pid.load(Ordering::Acquire);
-                starry_core::vsched::process_reinit(vspace_ptr, pid);
+                // Switch to new user PT so user_init() targets correct vDSO
+                let root = aspace.page_table_root();
+                let kernel_root = unsafe { axhal::asm::read_user_page_table() };
+                if root.as_usize() != 0 && root != kernel_root {
+                    unsafe {
+                        axhal::asm::write_user_page_table(root);
+                        core::arch::asm!("sfence.vma");
+                        riscv::register::sstatus::set_sum();
+                    }
+                }
                 starry_core::vsched::user_init_with_vspace(unsafe { *vspace_ptr });
+                if root.as_usize() != 0 && root != kernel_root {
+                    unsafe {
+                        axhal::asm::write_user_page_table(kernel_root);
+                        core::arch::asm!("sfence.vma");
+                    }
+                }
             }
             drop(aspace);
 

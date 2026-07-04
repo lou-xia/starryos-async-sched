@@ -279,11 +279,12 @@ pub fn set_current_affinity(cpumask: AxCpuMask) -> bool {
 pub fn yield_now() {
     let f = VSCHED2_YIELD.load(core::sync::atomic::Ordering::Acquire);
     if f != 0 {
-        let f: unsafe extern "C" fn() -> ! = unsafe { core::mem::transmute(f) };
-        unsafe { f() };
-    } else {
-        current_run_queue::<NoPreemptIrqSave>().yield_current()
+        unsafe {
+            core::arch::asm!("jalr {f}", f = in(reg) f);
+        }
+        return;
     }
+    current_run_queue::<NoPreemptIrqSave>().yield_current()
 }
 
 /// Current task is going to sleep for the given duration.

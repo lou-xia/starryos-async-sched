@@ -124,12 +124,9 @@ unsafe impl Sync for TrapHandlerCoroutine {}
 impl CoroutinePoll for TrapHandlerCoroutine {
     fn poll(&self) -> Poll<isize> {
         let handler_fn = self.handler_fn.load(Ordering::Acquire);
-// axlog::ax_println!("[handler::poll] handler_fn={:#x} queue={:#x}", handler_fn, queue);
         let queue = self.queue.load(Ordering::Acquire);
         let handler: fn(*const ()) = unsafe { core::mem::transmute(handler_fn) };
-// axlog::ax_println!("[handler::poll] handler returned, writing P marker");
         handler(queue as *const ());
-        unsafe { core::ptr::write_volatile(0xffffffc010000000 as *mut u8, b'P'); }
         Poll::Pending
     }
 }

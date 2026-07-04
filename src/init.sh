@@ -11,10 +11,10 @@ echo
 
 # Do your initialization here!
 
-# cd /tests/target/riscv64gc-unknown-linux-musl/release/
-# ./hello_world
-# cd /
-# rm -rf /tests
-# exit
-cd ~
-sh --login
+cd /tests/target/riscv64gc-unknown-linux-musl/release/
+./hello_world
+cd /
+rm -rf /tests
+exit
+# cd ~
+# sh --login

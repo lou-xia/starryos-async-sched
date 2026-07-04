@@ -230,7 +230,6 @@ pub fn sys_clone(
         *new_task.task_ext_mut() = Some(unsafe { AxTaskExt::from_impl(thr) });
         let (task, vti_ptr) = crate::task::new_vsched_user_task(new_task, &new_uctx);
 
-// axlog::ax_println!("[clone] calling process_init for child pid={}", tid);
         if !flags.contains(CloneFlags::THREAD) {
             let thr = task.try_as_thread().expect("vsched2 child must have thread");
             let saved_root = axhal::asm::read_user_page_table();
@@ -249,7 +248,7 @@ pub fn sys_clone(
             // (identical to load_user_app creation).
             if !flags.contains(CloneFlags::VM) {
                 let user_vdso_base =
-// axlog::ax_println!(
+
                     starry_core::vsched::context::get_process_vdso_base();
                 let vvar_size =
                     unsafe { starry_core::vsched::VSCHED2_VVAR_SIZE };
@@ -310,12 +309,10 @@ pub fn sys_clone(
                 }
             }
 
-// axlog::ax_println!(
             let child_pid = starry_core::vsched::process_init(vspace_ptr);
             unsafe { &*(vti_ptr as *const starry_core::vsched::VschedTaskImpl) }
                 .pid.store(child_pid, Ordering::Release);
             starry_core::vsched::user_init_with_vspace(unsafe { *vspace_ptr });
-// axlog::ax_println!(
             starry_core::vsched::push_task_into_process(vti_ptr, child_pid);
         }
 

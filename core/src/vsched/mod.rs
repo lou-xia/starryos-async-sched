@@ -1,5 +1,4 @@
 use alloc::{
-    alloc::{Layout, alloc},
     boxed::Box,
     string,
     sync::Arc,
@@ -34,8 +33,6 @@ static VSCHED2_READY: AtomicBool = AtomicBool::new(false);
 
 /// 内核 SATP 值，在 activate_vsched_trap_vector 时写入, trap 向量直接加载
 pub static KERNEL_SATP_VAL: AtomicUsize = AtomicUsize::new(0);
-/// trap 向量在 sscratch 被覆盖前保存的原始值, trap_entry 用于回收旧预保存栈
-pub static SAVED_SSCRATCH: AtomicUsize = AtomicUsize::new(0);
 /// 内核 gp 值, activate_vsched_trap_vector 时记录, trap 向量恢复
 pub static KERNEL_GP: AtomicUsize = AtomicUsize::new(0);
 /// trap 向量暂存用户 t0 (避免用用户栈)
@@ -46,8 +43,6 @@ pub static LAST_USER_TASK: AtomicUsize = AtomicUsize::new(0);
 pub static LAST_USER_PT_ROOT: AtomicUsize = AtomicUsize::new(0);
 pub static KERNEL_VVAR_BASE: AtomicUsize = AtomicUsize::new(0);
 pub static KERNEL_KSCHEDULER: AtomicUsize = AtomicUsize::new(0);
-pub static PRE_SAVE_BASE: AtomicUsize = AtomicUsize::new(0);
-pub static PRE_SAVE_TOP: AtomicUsize = AtomicUsize::new(0);
 
 pub const HIGHEST_PRIORITY: isize = 0;
 pub const LOWEST_PRIORITY: isize = 15;
@@ -100,36 +95,15 @@ unsafe extern "C" {
 }
 
 pub fn activate_vsched_trap_vector() {
-    // Layout: [pre-save stack 256KB][kernel SATP 8B]
-    let layout = alloc::alloc::Layout::from_size_align(262144 + 8, 16).unwrap();
-    let raw: *mut u8 = unsafe { alloc::alloc::alloc(layout) };
-    assert!(!raw.is_null(), "failed to alloc pre-save stack");
-    let stack_base = raw as usize;
-    let stack_top = raw as usize + 262144;
-    PRE_SAVE_BASE.store(raw as usize, Ordering::Release);
-    PRE_SAVE_TOP.store(stack_top, Ordering::Release);
     let kernel_satp: usize;
-    unsafe {
-        core::arch::asm!("csrr {}, satp", out(reg) kernel_satp);
-        let slot = stack_top as *mut usize;
-        slot.write_volatile(kernel_satp);
-    }
+    unsafe { core::arch::asm!("csrr {}, satp", out(reg) kernel_satp) };
     KERNEL_SATP_VAL.store(kernel_satp, Ordering::Release);
+
     let kernel_gp: usize;
     unsafe { core::arch::asm!("mv {}, gp", out(reg) kernel_gp) };
     KERNEL_GP.store(kernel_gp, Ordering::Release);
+
     unsafe {
-        let stvec_val: usize;
-        let sie_val: usize;
-        let sstatus_val: usize;
-        core::arch::asm!(
-            "csrr {}, stvec",
-            "csrr {}, sie",
-            "csrr {}, sstatus",
-            out(reg) stvec_val, out(reg) sie_val, out(reg) sstatus_val,
-// axlog::ax_println!(
-        );
-        core::arch::asm!("csrw sscratch, {}", in(reg) stack_top);
         axhal::asm::write_trap_vector_base(vsched2_trap_vector as *const () as usize);
     }
 }
@@ -142,35 +116,22 @@ pub fn process_init(vspace_ptr: *mut *mut ()) -> usize {
     libvsched2::process_init(vspace_ptr)
 }
 
-pub fn process_reinit(vspace_ptr: *mut *mut (), pid: usize) {
-    libvsched2::process_reinit(vspace_ptr, pid);
-}
-
 pub fn user_init_with_vspace(vspace: *mut ()) {
-    libvsched2::user_init_with_vspace(vspace);
-}
-
-pub fn user_init() {
-    libvsched2::user_init()
+    libvsched2::user_init(vspace);
 }
 
 pub fn push_task_into_process(task: *const (), pid: usize) -> bool {
     libvsched2::push_task_into_process(task, pid)
 }
 
-/// 为子进程重新映射 vDSO/VVAR。等效于 load_user_app 中的 map_so 调用，
-/// 给子进程分配独立的 .data/.bss 物理页（.bss 为全零）。
 pub fn map_vdso_for_child(vspace: *mut ()) -> usize {
     vdso::map_so(vspace as usize) as usize
 }
 
-/// 读取 vsched2 的当前任务指针 (CURRENT_TASK in VVAR)。
 pub fn current_task_ptr() -> *const () {
     libvsched2::current_task_ptr()
 }
 
-/// 设置 vsched2 的当前任务指针 (CURRENT_TASK in VVAR)。
-// axlog::ax_println!("[vsched::set_current] task={:#x}", task as usize);
 pub fn set_current_task_ptr(task: *const ()) {
     libvsched2::set_current_task_ptr(task);
 }
@@ -214,7 +175,6 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace_ptr: Option<*m
         libvsched2::VDSO_VTABLE
             .kernel_init_main
             .expect("kernel_init_main not in vtable")(init_stack_ptr, main_ptr as *const ());
-// axlog::ax_println!("vsched2: kernel_init_main done");
     }
 
     if let (Some(init_task_ptr), Some(vspace_ptr)) = (init_task_ptr, vspace_ptr) {
@@ -278,8 +238,7 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace_ptr: Option<*m
         // inside init_sources resolves to the user vDSO copy.  We call
         // user_init_with_vspace which translates the address to kva.
         let aspace_ptr = unsafe { *vspace_ptr };
-        libvsched2::user_init_with_vspace(aspace_ptr);
-// axlog::ax_println!("vsched2: user_init done");
+        libvsched2::user_init(aspace_ptr);
         libvsched2::push_task_into_process(init_task_ptr, pid);
         unsafe {
             asm::write_user_page_table(kernel_root);
@@ -297,9 +256,7 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace_ptr: Option<*m
         }
     }
 
-// axlog::ax_println!("vsched2: trap vector active, entering scheduler");
     activate_vsched_trap_vector();
-// axlog::ax_println!("vsched2: entering yield loop");
 
     loop {
         unsafe {

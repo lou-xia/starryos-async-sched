@@ -23,10 +23,6 @@ vsched2_trap_vector:
     sd      t3, -320(sp)
     sd      t4, -328(sp)
 
-    // Save old sscratch (= buffer_top) to SAVED_SSCRATCH for trap_entry
-    la      t0, {saved_sscratch_ptr}
-    sd      sp, 0(t0)              // SAVED_SSCRATCH = buffer_top
-
     // t4 holds buffer_base for trap frame accesses
     li      t4, {kernel_stack_size}
     sub     t4, sp, t4             // t4 = buffer_base (sp unchanged!)
@@ -133,7 +129,6 @@ vsched2_trap_vector:
 
 "#,
     kernel_gp_ptr = sym crate::vsched::KERNEL_GP,
-    saved_sscratch_ptr = sym crate::vsched::SAVED_SSCRATCH,
     kernel_stack_size = const crate::vsched::KERNEL_STACK,
 );
 
@@ -168,7 +163,6 @@ extern "C" fn vsched2_trap_entry_stub(
     let idx = trap_n & 3;
     unsafe { core::ptr::copy_nonoverlapping(tf_stack, &raw mut TF_POOL[idx], 1) };
     let tf_ptr = unsafe { &raw mut TF_POOL[idx] as *mut UserTrapFrame };
-// axlog::ax_println!(
 
     let mut task_ptr = task_ptr;
     if task_ptr.is_null() { task_ptr = libvsched2::current_task_ptr(); }
@@ -181,11 +175,10 @@ extern "C" fn vsched2_trap_entry_stub(
     let entry = unsafe {
         libvsched2::VDSO_VTABLE.raw_trap_entry.expect("raw_trap_entry not in vtable")
     };
-    let saved_sscratch = crate::vsched::SAVED_SSCRATCH.load(core::sync::atomic::Ordering::Acquire);
     unsafe {
         core::arch::asm!(
             "jalr {f}", f = in(reg) entry,
-            in("a0") trap_type, in("a1") privilege, in("a2") saved_sscratch,
+            in("a0") trap_type, in("a1") privilege,
             options(noreturn),
         );
     }
