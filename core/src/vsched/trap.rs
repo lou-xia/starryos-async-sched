@@ -1,10 +1,11 @@
 use alloc::{boxed::Box, sync::Arc};
 use core::{
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     task::Poll,
 };
 
 use axtask::TaskState as AxTaskState;
+use libvsched2::{self, SMP, Task};
 
 use super::{
     HIGHEST_PRIORITY, register_task,
@@ -15,16 +16,20 @@ use crate::config;
 
 type TrapDispatcher = fn(trapped_task: *const VschedTaskImpl);
 
+const CPU_NUM: usize = 1;
+
 // Last user task being serviced by trap handler (for page fault fallback)
-static LAST_TRAPPED_USER_TASK: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+static LAST_TRAPPED_USER_TASK: [core::sync::atomic::AtomicUsize; CPU_NUM] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; CPU_NUM];
 
 pub fn set_last_trapped_user_task(task: *const ()) {
-    LAST_TRAPPED_USER_TASK.store(task as usize, Ordering::Release);
+    LAST_TRAPPED_USER_TASK[<super::smp::VschedSmpImpl as SMP>::cpu_id()]
+        .store(task as usize, Ordering::Release);
 }
 
 pub fn get_last_trapped_user_task() -> *const VschedTaskImpl {
-    LAST_TRAPPED_USER_TASK.load(Ordering::Acquire) as *const VschedTaskImpl
+    LAST_TRAPPED_USER_TASK[<super::smp::VschedSmpImpl as SMP>::cpu_id()]
+        .load(Ordering::Acquire) as *const VschedTaskImpl
 }
 
 static TRAP_DISPATCHER: AtomicUsize = AtomicUsize::new(0);
@@ -106,7 +111,11 @@ impl libvsched2::TrapInfo for VschedTrapInfoImpl {
 // axlog::ax_println!("[new_handler] about to register_task");
         });
 // axlog::ax_println!("[new_handler] DONE ptr={:#x}", ptr as usize);
-        let ptr = register_task(task_ref, HIGHEST_PRIORITY, 0, Some(coro));
+        let ptr = register_task(task_ref, HIGHEST_PRIORITY, 0, Some(coro), 0);
+        // 为 handler 预分配一个栈，供 toggle 到线程模式时使用
+        let handler_stack = super::alloc_stack();
+        set_handler_stack(handler_stack as usize);
+        axlog::ax_println!("[new_handler] stack={:#x}", handler_stack as usize);
         ptr as *const ()
     }
 }
@@ -128,5 +137,42 @@ impl CoroutinePoll for TrapHandlerCoroutine {
         let handler: fn(*const ()) = unsafe { core::mem::transmute(handler_fn) };
         handler(queue as *const ());
         Poll::Pending
+    }
+}
+
+/// 记录 handler 的协程栈 VSI 指针，供 toggle 时设置 thread_stack_ptr 使用。
+static HANDLER_STACK: [AtomicUsize; CPU_NUM] = [const { AtomicUsize::new(0) }; CPU_NUM];
+
+pub fn set_handler_stack(stack: usize) {
+    HANDLER_STACK[<super::smp::VschedSmpImpl as SMP>::cpu_id()].store(stack, Ordering::Release);
+}
+
+/// 交替切换 handler 的 is_coroutine 状态。
+/// 第一次调用: coroutine → thread（yield 前）
+/// 第二次调用: thread → coroutine（yield 恢复后）
+pub fn toggle_handler() {
+    let ptr = libvsched2::current_task_ptr() as *const super::VschedTaskImpl;
+    if ptr.is_null() { return; }
+    let vti = unsafe { &*ptr };
+    if vti.pid.load(Ordering::Acquire) != 0 { return; }
+
+    let is_coro = vti.is_coroutine.load(Ordering::Acquire);
+    if is_coro {
+        // `block_on` runs with the trapped user AxTask as axtask::current(),
+        // so it cannot update this handler's state itself.  Mark the actual
+        // vsched2 current task blocked before yielding, or thread_entry_phase2
+        // will requeue the handler and starve the child awaited by wait4.
+        vti.set_state(libvsched2::TaskState::Blocked);
+        axlog::ax_println!("[toggle] coroutine → thread #{}", {
+            static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+            N.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        });
+        let stack = HANDLER_STACK[<super::smp::VschedSmpImpl as SMP>::cpu_id()].load(Ordering::Acquire);
+        vti.thread_stack_ptr.store(stack, Ordering::Release);
+        vti.is_coroutine.store(false, Ordering::Release);
+    } else {
+        axlog::ax_println!("[toggle] thread → coroutine");
+        vti.is_coroutine.store(true, Ordering::Release);
+        vti.thread_stack_ptr.store(0, Ordering::Release);
     }
 }

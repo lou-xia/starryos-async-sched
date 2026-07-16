@@ -24,6 +24,7 @@ pub struct VschedTaskImpl {
     pub task: AxTaskRef,
     pub priority: AtomicIsize,
     pub pid: AtomicUsize,
+    pub wake_generation: AtomicUsize,
     pub is_coroutine: AtomicBool,
     pub return_value: AtomicIsize,
     pub thread_stack_base: AtomicUsize,
@@ -51,6 +52,7 @@ impl VschedTaskImpl {
             task,
             priority: AtomicIsize::new(priority),
             pid: AtomicUsize::new(pid),
+            wake_generation: AtomicUsize::new(1),
             is_coroutine: AtomicBool::new(coroutine.is_some()),
             return_value: AtomicIsize::new(0),
             thread_stack_base: AtomicUsize::new(0),
@@ -156,14 +158,13 @@ pub fn task_from_raw(task: *const ()) -> Option<AxTaskRef> {
 }
 
 /// 创建 VschedTaskImpl 并返回裸指针。
-/// 调用前需先通过 `set_process_vdso_base` 设置当前进程的 vDSO 基址。
 pub fn register_task(
     task: AxTaskRef,
     priority: isize,
     pid: usize,
     coroutine: Option<Arc<dyn CoroutinePoll>>,
+    vdso_base: usize,
 ) -> *const VschedTaskImpl {
-    let vdso_base = super::context::get_process_vdso_base();
     let mut vti = Box::new(VschedTaskImpl::new(task, priority, pid, coroutine));
     vti.user_vdso_base.store(vdso_base, Ordering::Release);
     Box::into_raw(vti)

@@ -98,6 +98,7 @@ pub fn sys_clone(
     tls: usize,
     #[cfg(not(any(target_arch = "x86_64", target_arch = "loongarch64")))] child_tid: usize,
 ) -> AxResult<isize> {
+    axlog::ax_println!("[clone] ENTRY flags={:#x} stack={:#x} ptid={:#x} ctid={:#x} tls={:#x}", flags, stack, parent_tid, child_tid, tls);
     const FLAG_MASK: u32 = 0xff;
     let exit_signal = flags & FLAG_MASK;
     let mut flags = CloneFlags::from_bits_truncate(flags & !FLAG_MASK);
@@ -247,13 +248,13 @@ pub fn sys_clone(
             // own .data/.bss pages with a fresh zero-filled bss
             // (identical to load_user_app creation).
             if !flags.contains(CloneFlags::VM) {
-                let user_vdso_base =
-
-                    starry_core::vsched::context::get_process_vdso_base();
-                let vvar_size =
-                    unsafe { starry_core::vsched::VSCHED2_VVAR_SIZE };
-                let vdso_size =
-                    unsafe { starry_core::vsched::VSCHED2_VDSO_SIZE };
+                let (user_vdso_base, vvar_size, vdso_size) = {
+                    let guard = thr.proc_data.aspace.lock();
+                    let base = guard.vdso_base;
+                    (base,
+                     unsafe { starry_core::vsched::VSCHED2_VVAR_SIZE },
+                     unsafe { starry_core::vsched::VSCHED2_VDSO_SIZE })
+                };
                 let vvar_start = user_vdso_base - vvar_size;
                 let vdso_end = user_vdso_base + vdso_size;
 
@@ -309,11 +310,12 @@ pub fn sys_clone(
                 }
             }
 
-            let child_pid = starry_core::vsched::process_init(vspace_ptr);
+            let child_pid = starry_core::vsched::process_init(unsafe { *vspace_ptr });
             unsafe { &*(vti_ptr as *const starry_core::vsched::VschedTaskImpl) }
                 .pid.store(child_pid, Ordering::Release);
             starry_core::vsched::user_init_with_vspace(unsafe { *vspace_ptr });
-            starry_core::vsched::push_task_into_process(vti_ptr, child_pid);
+            let pushed = starry_core::vsched::push_task_into_process(vti_ptr, child_pid);
+            axlog::ax_println!("[clone] push_task pid={}, ok={}", child_pid, pushed);
         }
 
         add_task_to_table(&task);

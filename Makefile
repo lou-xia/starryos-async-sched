@@ -38,15 +38,22 @@ rootfs:
 	fi
 	@cp $(ROOTFS_IMG) arceos/disk.img
 
-copy_tests:
+copy_tests: rootfs
 	@if [ -d tests ]; then \
+		set -e; \
 		echo "Copying tests folder to disk.img..."; \
 		mkdir -p /tmp/disk_mount; \
 		sudo mount -t ext4 -o loop arceos/disk.img /tmp/disk_mount; \
-		sudo cp -r tests /tmp/disk_mount/; \
+		trap 'sudo umount /tmp/disk_mount' EXIT; \
+		sudo rm -rf /tmp/disk_mount/tests; \
+		sudo mkdir -p /tmp/disk_mount/tests/target/riscv64gc-unknown-linux-musl/release; \
+		find tests/target/riscv64gc-unknown-linux-musl/release \
+			-maxdepth 1 -type f -perm /111 \
+			-exec sudo cp {} /tmp/disk_mount/tests/target/riscv64gc-unknown-linux-musl/release/ \;; \
 		sudo umount /tmp/disk_mount; \
+		trap - EXIT; \
 		rm -rf /tmp/disk_mount; \
-		echo "Tests folder copied successfully."; \
+		echo "Tests copied successfully."; \
 	fi
 
 img:
@@ -67,6 +74,9 @@ test: uapp copy_tests
 	@rm -f .axconfig.toml
 	@make -C arceos run
 
+verify-vsched2: build
+	@bash scripts/check-vsched2-log.sh
+
 # Aliases
 rv:
 	$(MAKE) ARCH=riscv64 run
@@ -77,4 +87,4 @@ la:
 vf2:
 	$(MAKE) ARCH=riscv64 APP_FEATURES=vf2 MYPLAT=axplat-riscv64-visionfive2 BUS=mmio build
 
-.PHONY: build run justrun debug disasm clean
+.PHONY: build run justrun debug disasm clean verify-vsched2

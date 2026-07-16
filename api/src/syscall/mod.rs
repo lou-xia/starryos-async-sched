@@ -19,7 +19,13 @@ use self::{
     time::*,
 };
 
-pub fn handle_syscall(uctx: &mut UserContext) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyscallOutcome {
+    Complete,
+    Pending,
+}
+
+pub fn handle_syscall(uctx: &mut UserContext) -> SyscallOutcome {
     if uctx.sysno() == starry_core::vsched::context::VSCHED2_INTO_KERNEL_SYSNO {
         debug!("vsched2 into_kernel ecall intercepted, routing to raw_trap_entry");
         starry_core::vsched::context::enter_raw_trap_entry();
@@ -28,7 +34,7 @@ pub fn handle_syscall(uctx: &mut UserContext) {
     let Some(sysno) = Sysno::new(uctx.sysno()) else {
         warn!("Invalid syscall number: {}", uctx.sysno());
         uctx.set_retval(-LinuxError::ENOSYS.code() as _);
-        return;
+        return SyscallOutcome::Complete;
     };
 
     trace!("Syscall {sysno:?}");
@@ -438,7 +444,14 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         Sysno::fork => sys_fork(uctx),
         Sysno::exit => sys_exit(uctx.arg0() as _),
         Sysno::exit_group => sys_exit_group(uctx.arg0() as _),
-        Sysno::wait4 => sys_waitpid(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
+        Sysno::wait4 => match sys_waitpid_step(
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+        ) {
+            WaitPidStep::Complete(result) => result,
+            WaitPidStep::Pending => return SyscallOutcome::Pending,
+        },
         Sysno::getsid => sys_getsid(uctx.arg0() as _),
         Sysno::setsid => sys_setsid(),
         Sysno::getpgid => sys_getpgid(uctx.arg0() as _),
@@ -637,4 +650,5 @@ pub fn handle_syscall(uctx: &mut UserContext) {
     debug!("Syscall {sysno} return {result:?}");
 
     uctx.set_retval(result.unwrap_or_else(|err| -LinuxError::from(err).code() as _) as _);
+    SyscallOutcome::Complete
 }

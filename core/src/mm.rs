@@ -341,9 +341,6 @@ pub fn load_user_app(
     // vDSO 由新 loader 直接装入用户地址空间，并返回实际的 ELF 基址。
     let uspace_ptr = uspace as *mut _ as usize;
     let vdso_start = VirtAddr::from(map_so(uspace_ptr) as usize);
-    // warn!("vdso mapped at: {:#x}", vdso_start.as_usize());
-
-    crate::vsched::context::set_process_vdso_base(vdso_start.as_usize());
     uspace.vdso_base = vdso_start.as_usize();
 
     // Extend vDSO writable area to cover full VDSO_SIZE reserved space.

@@ -16,9 +16,10 @@
 
 use axhal::mem::phys_to_virt;
 use axmm::AddrSpace;
+use libvsched2::SMP;
 use memory_addr::{PhysAddr, VirtAddr};
 
-use super::{VSCHED2_VDSO_SIZE, VSCHED2_VDSO_START_PA, VSCHED2_VVAR_SIZE, VSCHED2_VVAR_START_PA, context::get_process_vdso_base};
+use super::{VSCHED2_VDSO_SIZE, VSCHED2_VDSO_START_PA, VSCHED2_VVAR_SIZE, VSCHED2_VVAR_START_PA, context::CURRENT_VDSO_BASE, smp::VschedSmpImpl};
 
 pub struct VschedUserDataImpl;
 
@@ -52,14 +53,16 @@ impl libvsched2::UserData for VschedUserDataImpl {
                 // Step 1: offset within .so
                 let offset = pos - kernel_vdso_start;
 
-                // Step 2: user vDSO base — prefer per-AddrSpace, fall back to global
+                // Step 2: user vDSO base — from vspace AddrSpace pointer,
+                // or from the current address space (updated by into_vspace).
                 const KERNEL_BASE: usize = 0xffffffc000000000;
                 let user_vdso_base = match vspace {
                     Some(ptr) if ptr as usize >= KERNEL_BASE => {
                         let aspace = unsafe { &*(ptr as *const AddrSpace) };
                         aspace.vdso_base
                     }
-                    _ => get_process_vdso_base(),
+                    _ => CURRENT_VDSO_BASE[<VschedSmpImpl as SMP>::cpu_id()]
+                        .load(core::sync::atomic::Ordering::Acquire),
                 };
                 if user_vdso_base == 0 {
                     return core::ptr::null_mut();

@@ -12,7 +12,7 @@ use libvsched2::{self, Stack as _};
 use vdso;
 
 pub mod context;
-mod smp;
+pub(crate) mod smp;
 pub mod stack;
 pub mod task;
 pub mod trap;
@@ -43,6 +43,11 @@ pub static LAST_USER_TASK: AtomicUsize = AtomicUsize::new(0);
 pub static LAST_USER_PT_ROOT: AtomicUsize = AtomicUsize::new(0);
 pub static KERNEL_VVAR_BASE: AtomicUsize = AtomicUsize::new(0);
 pub static KERNEL_KSCHEDULER: AtomicUsize = AtomicUsize::new(0);
+/// 当前正在被 trap_handler 服务的用户任务（vsched2 指针）。
+/// dispatch 时写入，mark_exited 时读取。不被 vsched2 CURRENT_TASK 覆盖。
+/// per-CPU 数组，每核心独立。
+const CPU_NUM: usize = 1;
+pub static TRAPPED_VSCHED_TASK: [AtomicUsize; CPU_NUM] = [const { AtomicUsize::new(0) }; CPU_NUM];
 
 pub const HIGHEST_PRIORITY: isize = 0;
 pub const LOWEST_PRIORITY: isize = 15;
@@ -112,8 +117,12 @@ pub fn push_task_to_kernel(task_ptr: *const ()) {
     libvsched2::push_task_into_current(task_ptr);
 }
 
-pub fn process_init(vspace_ptr: *mut *mut ()) -> usize {
-    libvsched2::process_init(vspace_ptr)
+pub fn process_init(vspace: *mut ()) -> usize {
+    libvsched2::process_init(vspace)
+}
+
+pub fn process_drop(pid: usize) {
+    libvsched2::process_drop(pid)
 }
 
 pub fn user_init_with_vspace(vspace: *mut ()) {
@@ -132,8 +141,44 @@ pub fn current_task_ptr() -> *const () {
     libvsched2::current_task_ptr()
 }
 
+pub fn wake_blocked_task(task: *const (), generation: usize) -> bool {
+    if task.is_null() {
+        return false;
+    }
+    let task_impl = unsafe { &*(task as *const task::VschedTaskImpl) };
+    use libvsched2::{Task as _, TaskState};
+    if task_impl.wake_generation.load(Ordering::Acquire) != generation {
+        return false;
+    }
+    match task_impl.state() {
+        TaskState::Blocked => {
+            task_impl.set_state(TaskState::Ready);
+            if libvsched2::push_task(task) {
+                true
+            } else {
+                task_impl.set_state(TaskState::Blocked);
+                false
+            }
+        }
+        TaskState::Exited => false,
+        _ => true,
+    }
+}
+
 pub fn set_current_task_ptr(task: *const ()) {
     libvsched2::set_current_task_ptr(task);
+}
+
+/// 设置被服务的用户任务指针（per-CPU）。
+pub fn set_trapped_vsched_task(task: *const ()) {
+    TRAPPED_VSCHED_TASK[<smp::VschedSmpImpl as libvsched2::SMP>::cpu_id()]
+        .store(task as usize, Ordering::Release);
+}
+
+/// 读取当前被 trap_handler 服务的用户任务（不被 CURRENT_TASK 影响）。
+pub fn trapped_vsched_task() -> *const () {
+    TRAPPED_VSCHED_TASK[<smp::VschedSmpImpl as libvsched2::SMP>::cpu_id()]
+        .load(Ordering::Acquire) as *const ()
 }
 
 /// 分配一个用于 vsched2 的 Stack 对象
@@ -145,6 +190,7 @@ pub fn alloc_stack() -> *mut () {
 pub fn set_vsched_task_exited(task: *const ()) {
     let vti = unsafe { &*(task as *const task::VschedTaskImpl) };
     use libvsched2::Task;
+    vti.wake_generation.fetch_add(1, Ordering::AcqRel);
     vti.set_state(libvsched2::TaskState::Exited);
 }
 
@@ -158,13 +204,14 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace_ptr: Option<*m
         fn vsched_yield_trampoline() -> !;
     }
     axtask::register_vsched2_yield(vsched_yield_trampoline);
+    axtask::register_block_on_toggle(trap::toggle_handler);
 
     // Initialize empty AxRunQueue so legacy code paths (AxWaker, timer
     // tick, etc.) that deref it under vsched2 don't LazyInit-panic.
     axtask::init_run_queue_empty();
 
     let curr = axtask::current();
-    let main_ptr = register_task(curr.clone(), LOWEST_PRIORITY, 0, None);
+    let main_ptr = register_task(curr.clone(), LOWEST_PRIORITY, 0, None, 0);
     // 分配一个 Stack 对象作为内核主任务的初始栈
     let init_stack_ptr = alloc_stack();
     unsafe { (main_ptr as *mut VschedTaskImpl).as_mut().unwrap() }
@@ -231,7 +278,7 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace_ptr: Option<*m
 // axlog::ax_println!("vsched2: calling process_init...");
         }
 // axlog::ax_println!("vsched2: process_init pid={}", pid);
-        let pid = libvsched2::process_init(vspace_ptr);
+        let pid = libvsched2::process_init(unsafe { *vspace_ptr });
 // axlog::ax_println!("[verify] vdso_pa={:#x} user_vdso_base={:#x}",
         // --- Verification ---
         // user_init must run with the user PT active so that &USER_SCHEDULER

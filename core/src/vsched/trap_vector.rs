@@ -157,19 +157,13 @@ extern "C" fn vsched2_trap_entry_stub(
         unsafe { core::arch::asm!("li {t}, -1", "csrw stimecmp, {t}", t = out(reg) _); }
     }
 
-    static TRAP_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-    static mut TF_POOL: [UserTrapFrame; 4] = unsafe { core::mem::zeroed() };
-    let trap_n = TRAP_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let idx = trap_n & 3;
-    unsafe { core::ptr::copy_nonoverlapping(tf_stack, &raw mut TF_POOL[idx], 1) };
-    let tf_ptr = unsafe { &raw mut TF_POOL[idx] as *mut UserTrapFrame };
-
     let mut task_ptr = task_ptr;
     if task_ptr.is_null() { task_ptr = libvsched2::current_task_ptr(); }
     if !task_ptr.is_null() {
         let vti = unsafe { &*(task_ptr as *const VschedTaskImpl) };
-// axlog::ax_println!(
-        vti.trap_frame.store(tf_ptr as usize, core::sync::atomic::Ordering::Release);
+        // Pending TrapInfo会长期持有该任务的trap frame。全局循环缓冲会被其它
+        // 任务的后续trap覆盖，因此必须保存到每个任务独占且地址稳定的frame中。
+        save_task_trap_frame(vti, tf_stack);
     }
 
     let entry = unsafe {
@@ -211,18 +205,48 @@ unsafe extern "C" fn vsched_yield_trampoline() -> ! {
 
 #[unsafe(no_mangle)]
 extern "C" fn vsched_yield_entry_stub(tf_stack: *const UserTrapFrame) -> ! {
-    let heap_tf = alloc::boxed::Box::new(unsafe { core::ptr::read(tf_stack) });
-    let tf_ptr = alloc::boxed::Box::into_raw(heap_tf);
-
     let current_task = libvsched2::current_task_ptr();
     if !current_task.is_null() {
         let vti = unsafe { &*(current_task as *const VschedTaskImpl) };
-// axlog::ax_println!(
-        vti.trap_frame.store(tf_ptr as usize, core::sync::atomic::Ordering::Release);
+        // handler会频繁yield；复用任务自己的稳定frame，避免每次yield泄漏一个Box。
+        save_task_trap_frame(vti, tf_stack);
     }
 
     let entry = unsafe {
         libvsched2::VDSO_VTABLE.raw_thread_entry.expect("raw_thread_entry not in vtable")
     };
     entry();
+}
+
+/// 将栈上的临时trap frame保存到任务独占的稳定存储中。
+///
+/// 用户任务通常在创建时已经分配了frame；内核handler第一次yield时才按需分配。
+/// compare_exchange使首次分配在后续多核场景下也不会安装两个不同的frame。
+fn save_task_trap_frame(
+    task: &VschedTaskImpl,
+    source: *const UserTrapFrame,
+) -> *mut UserTrapFrame {
+    use core::sync::atomic::Ordering;
+
+    let mut destination = task.trap_frame.load(Ordering::Acquire) as *mut UserTrapFrame;
+    if destination.is_null() {
+        let allocated = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(unsafe {
+            core::ptr::read(source)
+        }));
+        match task.trap_frame.compare_exchange(
+            0,
+            allocated as usize,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return allocated,
+            Err(existing) => {
+                unsafe { drop(alloc::boxed::Box::from_raw(allocated)) };
+                destination = existing as *mut UserTrapFrame;
+            }
+        }
+    }
+
+    unsafe { core::ptr::copy_nonoverlapping(source, destination, 1) };
+    destination
 }

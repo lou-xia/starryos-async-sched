@@ -4,12 +4,15 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use axhal::mem::phys_to_virt;
 use axmm::AddrSpace;
+use libvsched2;
 use memory_addr::PhysAddr;
 
 use super::{task::VschedTaskImpl, trapframe::UserTrapFrame};
 
 pub struct VschedContextImpl;
 pub struct VschedVSpaceImpl;
+
+const CPU_NUM: usize = 1;
 
 /// 将用户页表根写入 SATP，并刷新 TLB、设置 SUM 位。
 pub fn activate_user_aspace(root: PhysAddr) {
@@ -40,10 +43,10 @@ pub fn page_table_root_from_raw(ptr: *const ()) -> Option<PhysAddr> {
 pub const VSCHED2_INTO_KERNEL_SYSNO: usize = 0xdead;
 
 /// `raw_run_task` 在 .so 中的偏移量。
-/// `进入用户态地址 = user_vdso_base + offset`。
 static RAW_RUN_TASK_OFFSET: AtomicUsize = AtomicUsize::new(0);
-/// 当前进程的用户态 vDSO 基址，由 `mm.rs` 在加载 app 时设置。
-static CURRENT_PROCESS_VDSO_BASE: AtomicUsize = AtomicUsize::new(0);
+/// 当前地址空间的 vDSO 基址，`into_vspace` 切换时写入，`get_user_data` 读取。
+/// per-CPU 数组，与 vsched2 的 `CURRENT_VSPACE[CPU_NUM]` 模式一致。
+pub static CURRENT_VDSO_BASE: [AtomicUsize; CPU_NUM] = [const { AtomicUsize::new(0) }; CPU_NUM];
 
 /// 在 `init_vsched2_interfaces` 中调用，计算 `raw_run_task` 的 .so 内偏移。
 pub fn init_raw_run_task_offset() {
@@ -57,16 +60,6 @@ pub fn init_raw_run_task_offset() {
     }))
     .as_usize();
     RAW_RUN_TASK_OFFSET.store(kernel_addr - kernel_vdso_base, Ordering::Release);
-}
-
-/// 设置当前进程的用户态 vDSO 基址，`mm.rs` 在加载用户 app 后调用。
-pub fn set_process_vdso_base(base: usize) {
-    CURRENT_PROCESS_VDSO_BASE.store(base, Ordering::Release);
-}
-
-/// 读取当前进程的用户态 vDSO 基址，`register_task` 创建任务时读取。
-pub fn get_process_vdso_base() -> usize {
-    CURRENT_PROCESS_VDSO_BASE.load(Ordering::Acquire)
 }
 
 /// `handle_syscall` 拦截到特殊 ecall 时调用的桥接函数。
@@ -144,7 +137,6 @@ impl libvsched2::Context for VschedContextImpl {
         let tf_ptr = vsched_task.trap_frame.load(Ordering::Acquire);
         assert_ne!(tf_ptr, 0, "into_user_context: trap_frame is null");
         let tf = unsafe { &*(tf_ptr as *const UserTrapFrame) };
-        axlog::ax_println!("[into_user] pid={} sepc={:#x}", vsched_task.pid.load(Ordering::Acquire), tf.sepc);
         let spp = (tf.sstatus >> 8) & 1;
 // axlog::ax_println!(
         if spp == 0 && tf.sepc >= 0xffffffc000000000 {
@@ -157,9 +149,18 @@ impl libvsched2::Context for VschedContextImpl {
 
 impl libvsched2::VSpace for VschedVSpaceImpl {
     /// 切换到指定地址空间（写 SATP + 刷新 TLB + SUM）。
-    fn into_vspace(vspace: *mut ()) {
+    /// vspace 通过 `from_mut(ptr)` 绑定到 `&self`。
+    fn into_vspace(&self) {
+        let vspace = self as *const Self as *mut ();
         if let Some(root) = page_table_root_from_raw(vspace) {
+            let aspace = unsafe { &*(vspace as *const AddrSpace) };
+            CURRENT_VDSO_BASE[<super::smp::VschedSmpImpl as libvsched2::SMP>::cpu_id()]
+                .store(aspace.vdso_base, Ordering::Release);
             activate_user_aspace(root);
         }
+    }
+
+    fn dealloc(&self) {
+        // No-op: address space lifecycle managed by ProcessData Arc.
     }
 }

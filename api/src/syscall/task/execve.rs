@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, string::ToString, sync::Arc, vec::Vec};
+use alloc::{string::ToString, sync::Arc, vec::Vec};
 use core::ffi::c_char;
 
 use axerrno::{AxError, AxResult};
@@ -20,6 +20,7 @@ pub fn sys_execve(
 ) -> AxResult<isize> {
 // axlog::ax_println!("[execve] path={}", path);
     let path = vm_load_string(path)?;
+    axlog::ax_println!("[execve] ENTRY pid={} path={}", current().id().as_u64(), path);
 
     let args = if argv.is_null() {
         Vec::new()
@@ -54,15 +55,10 @@ pub fn sys_execve(
     match load_user_app(&mut aspace, Some(path.as_str()), &args, &envs) {
 // axlog::ax_println!("[execve] load_user_app OK entry={:#x} sp={:#x}",
         Ok((entry_point, user_stack_base)) => {
-            let vspace_ptr = {
-                let p: *mut () = &raw const *aspace as *mut ();
-                Box::into_raw(Box::new(p))
-            };
+            let vspace = &raw const *aspace as *mut ();
 
-            // execve replaces the address space; re-init the vsched2 scheduler
-            // in the new vDSO. Switch PT to new AS, call user_init(), then
-            // restore kernel PT. vspace pointer in PROCESS_INFO_TABLE is
-            // updated by process_init; no separate reinit API exists.
+            // execve replaces the vDSO private data, so create a scheduler in the
+            // new address space with the existing vsched2 process lifecycle APIs.
             if vsched2_active() {
                 // Switch to new user PT so user_init() targets correct vDSO
                 let root = aspace.page_table_root();
@@ -74,7 +70,16 @@ pub fn sys_execve(
                         riscv::register::sstatus::set_sum();
                     }
                 }
-                starry_core::vsched::user_init_with_vspace(unsafe { *vspace_ptr });
+                let trapped = starry_core::vsched::trapped_vsched_task()
+                    as *const starry_core::vsched::task::VschedTaskImpl;
+                assert!(!trapped.is_null(), "execve: no trapped vsched task");
+                let task = unsafe { &*trapped };
+                let old_pid = task.pid.load(core::sync::atomic::Ordering::Acquire);
+                let new_pid = starry_core::vsched::process_init(vspace);
+                starry_core::vsched::user_init_with_vspace(vspace);
+                task.pid.store(new_pid, core::sync::atomic::Ordering::Release);
+                starry_core::vsched::process_drop(old_pid);
+                axlog::ax_println!("[execve] vsched pid {} -> {}", old_pid, new_pid);
                 if root.as_usize() != 0 && root != kernel_root {
                     unsafe {
                         axhal::asm::write_user_page_table(kernel_root);

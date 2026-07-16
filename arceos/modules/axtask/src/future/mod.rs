@@ -79,11 +79,24 @@ pub fn block_on<F: IntoFuture>(f: F) -> F::Output {
                     let woke = axwaker.woke.lock();
                     if !*woke {
                         drop(woke);
-                        // Mark Ready so vsched2's push_prev_task re-queues us.
-                        // Without this, Blocked tasks are invisible to push_prev_task
-                        // and get permanently lost from the ready_queue.
-                        task.set_state(crate::TaskState::Ready);
+                        // Set Blocked so vsched2's push_prev_task skips us,
+                        // allowing other processes to run. The wake_by_ref
+                        // path will re-queue us when the event fires.
+                        task.set_state(crate::TaskState::Blocked);
+                        // Toggle handler from coroutine → thread so that
+                        // yield's restore_context() can resume our stack frame.
+                        let toggle = crate::api::BLOCK_ON_TOGGLE
+                            .load(core::sync::atomic::Ordering::Acquire);
+                        if toggle != 0 {
+                            let f: fn() = unsafe { core::mem::transmute(toggle) };
+                            f();
+                        }
                         crate::yield_now();
+                        // Resume: toggle back to coroutine
+                        if toggle != 0 {
+                            let f: fn() = unsafe { core::mem::transmute(toggle) };
+                            f();
+                        }
                     } else {
                         drop(woke);
                     }

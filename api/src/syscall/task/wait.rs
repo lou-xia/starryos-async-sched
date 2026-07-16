@@ -1,10 +1,15 @@
-use alloc::vec::Vec;
-use core::{future::poll_fn, task::Poll};
+use alloc::{sync::Arc, task::Wake, vec::Vec};
+use core::{
+    future::poll_fn,
+    sync::atomic::{AtomicBool, Ordering},
+    task::{Context, Poll, Waker},
+};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axtask::{
     current,
     future::{block_on, interruptible},
+    WeakAxTaskRef,
 };
 use bitflags::bitflags;
 use linux_raw_sys::general::{
@@ -13,6 +18,67 @@ use linux_raw_sys::general::{
 use starry_core::task::AsThread;
 use starry_process::{Pid, Process};
 use starry_vm::{VmMutPtr, VmPtr};
+
+pub(crate) enum WaitPidStep {
+    Complete(AxResult<isize>),
+    Pending,
+}
+
+struct TrapTaskWaker {
+    task: usize,
+    task_ref: WeakAxTaskRef,
+    generation: usize,
+    armed: AtomicBool,
+    woken: AtomicBool,
+    queued: AtomicBool,
+}
+
+impl TrapTaskWaker {
+    fn new(task: *const (), task_ref: WeakAxTaskRef, generation: usize) -> Self {
+        Self {
+            task: task as usize,
+            task_ref,
+            generation,
+            armed: AtomicBool::new(false),
+            woken: AtomicBool::new(false),
+            queued: AtomicBool::new(false),
+        }
+    }
+
+    fn arm(&self) {
+        self.armed.store(true, Ordering::Release);
+        self.queue_if_ready();
+    }
+
+    fn queue_if_ready(&self) {
+        if !self.armed.load(Ordering::Acquire) || !self.woken.load(Ordering::Acquire) {
+            return;
+        }
+        if self.queued.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Some(_task_ref) = self.task_ref.upgrade() else {
+            return;
+        };
+        if starry_core::vsched::wake_blocked_task(
+            self.task as *const (),
+            self.generation,
+        ) {
+            axlog::ax_println!("[wait4] WAKE task={:#x}", self.task);
+        }
+    }
+}
+
+impl Wake for TrapTaskWaker {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.woken.store(true, Ordering::Release);
+        self.queue_if_ready();
+    }
+}
 
 bitflags! {
     #[derive(Debug)]
@@ -59,7 +125,8 @@ impl WaitPid {
     }
 }
 
-pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32) -> AxResult<isize> {
+pub fn sys_waitpid_step(pid: i32, exit_code: *mut i32, options: u32) -> WaitPidStep {
+    axlog::ax_println!("[wait4] ENTRY pid={} options={:#x}", pid, options);
 // axlog::ax_println!("[wait] pid={} options={:?}", pid, options);
     let options = WaitOptions::from_bits_truncate(options);
 
@@ -85,7 +152,7 @@ pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32) -> AxResult<isiz
         .filter(|child| pid.apply(child))
         .collect::<Vec<_>>();
     if children.is_empty() {
-        return Err(AxError::from(LinuxError::ECHILD));
+        return WaitPidStep::Complete(Err(AxError::from(LinuxError::ECHILD)));
     }
 
     let check_children = || {
@@ -104,8 +171,46 @@ pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32) -> AxResult<isiz
         }
     };
 // axlog::ax_println!("[wait] blocking...");
+    let trapped_task = starry_core::vsched::trapped_vsched_task();
+    if axtask::vsched2_active() && !trapped_task.is_null() {
+        let task = unsafe {
+            &*(trapped_task as *const starry_core::vsched::task::VschedTaskImpl)
+        };
+        let waiter = Arc::new(TrapTaskWaker::new(
+            trapped_task,
+            Arc::downgrade(&task.task),
+            task.wake_generation.load(Ordering::Acquire),
+        ));
+        let waker = Waker::from(waiter.clone());
+        let mut cx = Context::from_waker(&waker);
 
-    block_on(interruptible(poll_fn(|cx| {
+        if curr.poll_interrupt(&mut cx).is_ready() {
+            return WaitPidStep::Complete(Err(AxError::Interrupted));
+        }
+
+        if let Some(result) = check_children().transpose() {
+            return WaitPidStep::Complete(result);
+        }
+
+        // 先注册Waker再复查条件，覆盖child-exit发生在首次检查与注册之间的竞态。
+        proc_data.child_exit_event.register(&waker);
+        if let Some(result) = check_children().transpose() {
+            return WaitPidStep::Complete(result);
+        }
+
+        task.task.set_state(axtask::TaskState::Blocked);
+        waiter.arm();
+        axlog::ax_println!(
+            "[wait4] PENDING task={:#x} children={}",
+            trapped_task as usize,
+            children.len()
+        );
+        return WaitPidStep::Pending;
+    }
+
+    axlog::ax_println!("[wait4] BLOCK children={}", children.len());
+
+    let result = block_on(interruptible(poll_fn(|cx| {
         match check_children().transpose() {
             Some(res) => Poll::Ready(res),
             None => {
@@ -113,5 +218,8 @@ pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32) -> AxResult<isiz
                 Poll::Pending
             }
         }
-    })))?
+    })))
+    .map_err(AxError::from)
+    .and_then(|result| result);
+    WaitPidStep::Complete(result)
 }

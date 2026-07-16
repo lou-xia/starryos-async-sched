@@ -11,11 +11,19 @@ use kernel_guard::NoPreemptIrqSave;
 /// Function pointer for vsched2 yield trampoline.
 /// When set (non-zero), `yield_now()` delegates to vsched2 instead of AxRunQueue.
 static VSCHED2_YIELD: AtomicUsize = AtomicUsize::new(0);
+/// Toggle function for block_on: toggles handler coroutine ↔ thread mode.
+/// First call before yield (→ thread), second call after yield resume (→ coroutine).
+pub(crate) static BLOCK_ON_TOGGLE: AtomicUsize = AtomicUsize::new(0);
 
 /// Register the vsched2 yield trampoline. After this, all `yield_now()` calls
 /// will enter the vsched2 scheduler instead of the legacy AxRunQueue.
 pub fn register_vsched2_yield(yield_fn: unsafe extern "C" fn() -> !) {
     VSCHED2_YIELD.store(yield_fn as usize, core::sync::atomic::Ordering::Release);
+}
+
+/// Register the block_on toggle function. Called from block_on before/after yield.
+pub fn register_block_on_toggle(toggle: fn()) {
+    BLOCK_ON_TOGGLE.store(toggle as usize, core::sync::atomic::Ordering::Release);
 }
 
 /// Returns true if vsched2 yield is registered (non-zero).

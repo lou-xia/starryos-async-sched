@@ -1,5 +1,33 @@
 # StarryOS vsched2 集成架构文档
 
+## 相关文档索引
+
+| 文档 | 路径 | 说明 |
+|------|------|------|
+| **TODO.md** | `core/src/vsched/TODO.md` | 问题跟踪、已修/待修列表、调试笔记 |
+| **vsched2 接口文档** | `vdso/doc/vsched2_interfaces.md` | vDSO VTABLE 接口定义、调用关系 |
+| **vsched2 架构文档** | `vdso/doc/vsched2_architecture.md` | vsched2 内部模块架构 |
+| **vsched2 调度核心** | `vsched/vsched2/src/main_loop.rs` | kschedule / push_prev_task / run_task / krun_utask |
+| **vsched2 进程表** | `vsched/vsched2/src/schedule/process_info.rs` | highest_prio_process / register_process |
+| **vsched2 调度器** | `vsched/vsched2/src/schedule/scheduler.rs` | pop_task / push_task / update_prio |
+| **vsched2 栈管理** | `vsched/vsched2/src/stack/handler.rs` | free_stacks / alloc_stack / dealloc_stack |
+| **vsched2 陷阱队列** | `vsched/vsched2/src/schedule/trap_wait_queue.rs` | hightest_priority / take_task |
+| **vDSO 日志 (log_init)** | `vdso_crate_template/.../vdso_helper/src/log_init.rs` | init_log / LogVirtImpl |
+| **vDSO 加载器** | `vdso_vsched2_output/libvsched2/src/loader.rs` | map_so（ELF 段映射 + 重定位） |
+| **StarryOS VSpace** | `core/src/vsched/context.rs` | into_vspace / into_user_context / CURRENT_VDSO_BASE |
+| **StarryOS UserData** | `core/src/vsched/userdata.rs` | get_user_data（5 步地址转换） |
+| **StarryOS trap 向量** | `core/src/vsched/trap_vector.rs` | vsched2_trap_vector / vsched_yield_trampoline |
+| **StarryOS 栈实现** | `core/src/vsched/stack.rs` | VschedStackImpl（alloc/dealloc/base） |
+| **StarryOS trap handler** | `core/src/vsched/trap.rs` | toggle_handler / TrapHandlerCoroutine |
+| **StarryOS 任务实现** | `core/src/vsched/task.rs` | VschedTaskImpl / register_task |
+| **StarryOS 调度初始化** | `core/src/vsched/mod.rs` | vsched2_bootstrap / TRAPPED_VSCHED_TASK |
+| **block_on / yield** | `arceos/modules/axtask/src/future/mod.rs` + `api.rs` | block_on 调度接口 / yield_now / toggle 注册 |
+| **Task State 桥接** | `arceos/modules/axtask/src/api.rs` | BLOCK_ON_TOGGLE / register_block_on_toggle |
+| **CPU trap vec** | `arceos/modules/axcpu/src/riscv/trap.rs` | 页故障 panic handler |
+| **VDSO 链接器脚本** | `vdso_vsched2_output/vdso_linker.lds` | 段布局：text_seg(RX) / ro_seg(R) / data_seg(RW) |
+| **VDSO 版本映射** | `vdso_vsched2_output/vdso_version.map` | 导出符号列表 |
+| **VDSO VTABLE 偏移表** | `vdso_vsched2_output/libvsched2/src/api.rs` | 各函数在 .so 中的偏移（自动生成） |
+
 ## 项目概述
 
 将 vsched2 统一调度器（基于 vDSO 机制）移植到 StarryOS。vsched2 是一个分层固定优先级调度器，支持内核/用户协同、线程/协程统一抽象、多事件源扩展。
@@ -148,3 +176,11 @@ ALL traps 统一走事件源:
 4. `register_task` 对内核任务误设 `user_vdso_base` — 需在设置前判断 pid
 5. TrapInfo handler 协程 AXTask 永不释放
 6. `VschedStackImpl::dealloc` 时未从 free_stacks 移除, 产生悬空引用 (TODO)
+
+
+## 测试相关的指令
+
+- make build：编译
+- make run：编译并运行
+- make test：编译（包括测试文件）并运行（推荐使用这个指令测试）
+

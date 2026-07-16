@@ -24,7 +24,7 @@ use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
     signal::{check_signals, unblock_next_signal},
-    syscall::handle_syscall,
+    syscall::{SyscallOutcome, handle_syscall},
 };
 
 /// Create a new user task.
@@ -46,7 +46,9 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
                 set_timer_state(&curr, TimerState::Kernel);
 
                 match reason {
-                    ReturnReason::Syscall => handle_syscall(&mut uctx),
+                    ReturnReason::Syscall => {
+                        let _ = handle_syscall(&mut uctx);
+                    }
                     // ReturnReason::Syscall => {
                     //     let finish = Arc::new(AtomicBool::new(false));
                     //     syscall_task(uctx, finish.clone());
@@ -122,6 +124,7 @@ pub fn new_vsched_user_task(
     let thr = task_ref.try_as_thread().expect("vsched2 child must have thread");
     let pid = thr.proc_data.proc.pid() as usize;
     let user_root = thr.proc_data.aspace.lock().page_table_root().as_usize();
+    let vdso_base = thr.proc_data.aspace.lock().vdso_base;
     let aspace_mutex_ptr = Arc::as_ptr(&thr.proc_data.aspace) as usize;
 
     // Copy ALL parent registers (clone/fork semantics: child shares parent state)
@@ -139,7 +142,7 @@ pub fn new_vsched_user_task(
 
     let tf_ptr = Box::into_raw(tf);
 
-    let vti = starry_core::vsched::register_task(task_ref.clone(), 0, pid, None);
+    let vti = starry_core::vsched::register_task(task_ref.clone(), 0, pid, None, vdso_base);
     let vti_ref = unsafe { &*vti };
     vti_ref.trap_frame.store(tf_ptr as usize, Ordering::Release);
     vti_ref.user_page_table_root.store(user_root, Ordering::Release);
@@ -340,6 +343,8 @@ fn vsched_trap_dispatcher(trapped_task: *const VschedTaskImpl) {
     // Store the actual user task being serviced to use for page fault resolution.
     static LAST_ECALL_USER_TASK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+    vti.task.set_state(AxTaskState::Running);
+
     match tf.scause {
         // Timer interrupt: handled by stub (stimecmp reset), just ignore here
 // if n < 5 { axlog::ax_println!("[stats] timer={}", n+1); }
@@ -376,23 +381,21 @@ fn vsched_trap_dispatcher(trapped_task: *const VschedTaskImpl) {
                 unsafe { scope_local::ActiveScope::set(&*guard) };
                 guard
             });
+            // 记录被服务的用户任务，供 mark_exited 使用。
+            // 不覆盖 vsched2 CURRENT_TASK（仍是 trap_handler），
+            // 确保 yield 时从 handler 身份走 run_task 路径。
+            starry_core::vsched::set_trapped_vsched_task(trapped_task as *const ());
 
-            // Save vsched2 CURRENT_TASK and temporarily set it to the
-            // trapped user task so that all syscall handlers can use
-            // current_task_ptr() correctly.
-            let saved_task = starry_core::vsched::current_task_ptr();
-            starry_core::vsched::set_current_task_ptr(trapped_task as *const ());
-
-            let a7 = uctx.sysno();
-            axtask::with_current_task(&vti.task, || {
-                handle_syscall(&mut uctx);
+            let syscall_outcome = axtask::with_current_task(&vti.task, || {
+                handle_syscall(&mut uctx)
             });
-
-            // Restore vsched2 CURRENT_TASK so the trap_handler can resume
-            starry_core::vsched::set_current_task_ptr(saved_task);
 
             drop(scope_guard);
             scope_local::ActiveScope::set_global();
+
+            if syscall_outcome == SyscallOutcome::Pending {
+                return;
+            }
 
             let tf_mut = unsafe { &mut *(tf_ptr as *mut UserTrapFrame) };
             let new_ip = uctx.ip();
@@ -455,39 +458,39 @@ fn vsched_trap_dispatcher(trapped_task: *const VschedTaskImpl) {
             }
         }
 // axlog::ax_println!("[ecall] a7={} a0={} a1={:#x} a2={} sepc={:#x} sp={:#x}",
-         8 => {
-            let mut uctx = UserContext::new(
-                tf.sepc + 4,
-                VirtAddr::from(tf.regs.sp),
-                tf.regs.a0,
-            );
-            uctx.set_arg1(tf.regs.a1);
-            uctx.set_arg2(tf.regs.a2);
-            uctx.set_arg3(tf.regs.a3);
-            uctx.set_arg4(tf.regs.a4);
-            uctx.set_arg5(tf.regs.a5);
-            uctx.set_sysno(tf.regs.a7);
-            uctx.set_ra(tf.regs.ra);
-            uctx.set_tls(tf.regs.tp);
+//          8 => {
+//             let mut uctx = UserContext::new(
+//                 tf.sepc + 4,
+//                 VirtAddr::from(tf.regs.sp),
+//                 tf.regs.a0,
+//             );
+//             uctx.set_arg1(tf.regs.a1);
+//             uctx.set_arg2(tf.regs.a2);
+//             uctx.set_arg3(tf.regs.a3);
+//             uctx.set_arg4(tf.regs.a4);
+//             uctx.set_arg5(tf.regs.a5);
+//             uctx.set_sysno(tf.regs.a7);
+//             uctx.set_ra(tf.regs.ra);
+//             uctx.set_tls(tf.regs.tp);
 
-            // Store user task for page fault fallback
-            LAST_ECALL_USER_TASK.store(trapped_task as usize, Ordering::Release);
+//             // Store user task for page fault fallback
+//             LAST_ECALL_USER_TASK.store(trapped_task as usize, Ordering::Release);
 
-            axtask::with_current_task(&vti.task, || {
-                handle_syscall(&mut uctx);
-            });
+//             axtask::with_current_task(&vti.task, || {
+//                 handle_syscall(&mut uctx);
+//             });
 
-            let tf_mut = unsafe { &mut *(tf_ptr as *mut UserTrapFrame) };
-            // Only update caller-saved registers that syscall may change.
-            // Keep callee-saved regs (s0-s11) from the original trap frame.
-            tf_mut.regs.a0 = uctx.arg0();  // return value
-            tf_mut.regs.a1 = uctx.arg1();  // may be modified (pipe, etc.)
-            // a2-a5: keep original (not usually modified by kernel)
-            // a6-a7: keep original
-            tf_mut.sepc = uctx.ip();
-// axlog::ax_println!("[ecall] ret a0={} new_sepc={:#x}", tf_mut.regs.a0, tf_mut.sepc);
-            tf_mut.sstatus = uctx.sstatus.bits();
-        }
+//             let tf_mut = unsafe { &mut *(tf_ptr as *mut UserTrapFrame) };
+//             // Only update caller-saved registers that syscall may change.
+//             // Keep callee-saved regs (s0-s11) from the original trap frame.
+//             tf_mut.regs.a0 = uctx.arg0();  // return value
+//             tf_mut.regs.a1 = uctx.arg1();  // may be modified (pipe, etc.)
+//             // a2-a5: keep original (not usually modified by kernel)
+//             // a6-a7: keep original
+//             tf_mut.sepc = uctx.ip();
+// // axlog::ax_println!("[ecall] ret a0={} new_sepc={:#x}", tf_mut.regs.a0, tf_mut.sepc);
+//             tf_mut.sstatus = uctx.sstatus.bits();
+//         }
         1 | 5 | 7 => {
             axlog::error!(
                 "vsched trap: memory access fault scause={}, vaddr={:#x}, task={}",
