@@ -158,11 +158,9 @@ pub fn toggle_handler() {
 
     let is_coro = vti.is_coroutine.load(Ordering::Acquire);
     if is_coro {
-        // `block_on` runs with the trapped user AxTask as axtask::current(),
-        // so it cannot update this handler's state itself.  Mark the actual
-        // vsched2 current task blocked before yielding, or thread_entry_phase2
-        // will requeue the handler and starve the child awaited by wait4.
-        vti.set_state(libvsched2::TaskState::Blocked);
+        // vsched2 requires Blocking before the context-save path commits the
+        // task to Blocked.  Setting Blocked here would bypass that protocol.
+        vti.set_state(libvsched2::TaskState::Blocking);
         axlog::ax_println!("[toggle] coroutine → thread #{}", {
             static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
             N.fetch_add(1, core::sync::atomic::Ordering::Relaxed)

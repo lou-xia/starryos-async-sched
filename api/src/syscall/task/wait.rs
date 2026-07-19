@@ -198,7 +198,6 @@ pub fn sys_waitpid_step(pid: i32, exit_code: *mut i32, options: u32) -> WaitPidS
             return WaitPidStep::Complete(result);
         }
 
-        task.task.set_state(axtask::TaskState::Blocked);
         waiter.arm();
         axlog::ax_println!(
             "[wait4] PENDING task={:#x} children={}",

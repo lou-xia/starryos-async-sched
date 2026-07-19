@@ -60,6 +60,7 @@ pub fn to_vsched_state(s: AxTaskState) -> libvsched2::TaskState {
         AxTaskState::Running => libvsched2::TaskState::Running,
         AxTaskState::Blocked => libvsched2::TaskState::Blocked,
         AxTaskState::Exited => libvsched2::TaskState::Exited,
+        AxTaskState::Blocking => libvsched2::TaskState::Blocking,
     }
 }
 
@@ -68,7 +69,7 @@ pub fn from_vsched_state(s: libvsched2::TaskState) -> AxTaskState {
         libvsched2::TaskState::Ready => AxTaskState::Ready,
         libvsched2::TaskState::Running => AxTaskState::Running,
         libvsched2::TaskState::Blocked => AxTaskState::Blocked,
-        libvsched2::TaskState::Blocking => AxTaskState::Blocked,
+        libvsched2::TaskState::Blocking => AxTaskState::Blocking,
         libvsched2::TaskState::Exited => AxTaskState::Exited,
     }
 }
@@ -150,16 +151,32 @@ pub fn wake_blocked_task(task: *const (), generation: usize) -> bool {
     if task_impl.wake_generation.load(Ordering::Acquire) != generation {
         return false;
     }
-    match task_impl.state() {
+    let previous = task_impl.match_set_state(
+        TaskState::Ready,
+        TaskState::Running,
+        TaskState::Ready,
+        TaskState::Exited,
+        TaskState::Ready,
+    );
+    match previous {
         TaskState::Blocked => {
-            task_impl.set_state(TaskState::Ready);
             if libvsched2::push_task(task) {
                 true
             } else {
-                task_impl.set_state(TaskState::Blocked);
+                task_impl.match_set_state(
+                    TaskState::Blocked,
+                    TaskState::Running,
+                    TaskState::Blocked,
+                    TaskState::Exited,
+                    TaskState::Blocking,
+                );
                 false
             }
         }
+        // A wake racing with context save changes Blocking to Ready.  The
+        // vsched2 thread-entry path observes Ready and performs the enqueue
+        // after the context is safe to resume.
+        TaskState::Blocking => true,
         TaskState::Exited => false,
         _ => true,
     }

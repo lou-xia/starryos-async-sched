@@ -5,6 +5,8 @@
 | 文档 | 路径 | 说明 |
 |------|------|------|
 | **TODO.md** | `core/src/vsched/TODO.md` | 问题跟踪、已修/待修列表、调试笔记 |
+| **block_on 设计简述** | `core/src/vsched/block_on设计简述.md` | 当前问题、短期 SyscallTask 方案与最终协程目标 |
+| **block_on 设计文档** | `core/src/vsched/block_on设计文档.md` | 统一 Execution Flow、SyscallExecutionFlow、park/wake、多核与异步 syscall 设计 |
 | **vsched2 接口文档** | `vdso/doc/vsched2_interfaces.md` | vDSO VTABLE 接口定义、调用关系 |
 | **vsched2 架构文档** | `vdso/doc/vsched2_architecture.md` | vsched2 内部模块架构 |
 | **vsched2 调度核心** | `vsched/vsched2/src/main_loop.rs` | kschedule / push_prev_task / run_task / krun_utask |
@@ -183,4 +185,3 @@ ALL traps 统一走事件源:
 - make build：编译
 - make run：编译并运行
 - make test：编译（包括测试文件）并运行（推荐使用这个指令测试）
-

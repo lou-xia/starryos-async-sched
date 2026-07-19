@@ -2,43 +2,37 @@
 
 > 平台：RISC-V 64、QEMU virt、当前单核，后续考虑多核。
 >
-> 当前 vsched2：`main@56be669`。
+> 当前 vsched2：`main@585b86d`。
 >
-> `Welcome to Starry OS!` 与 `Hello, World!` 均已重新验证。
+> 当前版本已重新验证 `Welcome to Starry OS!`；之后在 wait4 replay 与 trap-handler 状态提交冲突处 panic，尚未重新到达 `Hello, World!`。
 >
 > 完整结构说明见 `core/src/vsched/ARCHITECTURE.md`。
 
-## 1. 当前结论
+## 1. 当前结论（2026-07-18）
 
-wait4 卡死可以在不修改 vsched2 公共 API 和 trait 的前提下解决。
-
-当前方案不再使用：
-
-- `TrapPollResult`；
-- `TrapInfo::handle() -> Complete/Pending`；
-- `current_trap_token()` / `wake_trap()`；
-- vsched2 内部的 `pending` / `woken_pending` 队列；
-- `process_reinit()` 新 API。
-
-保留 vsched2 原有同步 TrapInfo 接口和每 CPU 单 handler。阻塞 continuation 改由被 trap 的用户任务自身承担：
+新版 vsched2 已增加原子 `Task::match_set_state`，StarryOS 已用同一份 AxTaskState 承载 `Ready/Running/Blocking/Blocked/Exited` 五态，构建通过。同步 trap 的基础状态流程已经统一为：
 
 ```text
-父进程执行 wait4
-  → 条件未满足
-  → 保留原 ecall trap frame，不前移 sepc
-  → 用户任务设为 Blocked
-  → 当前 TrapInfo 正常结束并释放
-  → 单 handler 继续处理子进程的新 TrapInfo
-
-子进程退出
-  → child_exit_event 唤醒 Waker
-  → Waker 使用已有 push_task() 将父用户任务放回 ReadyQueue
-  → 父用户任务从原 ecall PC 恢复
-  → 重新产生一个普通 TrapInfo
-  → wait4 再次检查条件并完成
+trap_entry: Running → Blocked
+trap_handler 完成: Blocked → Ready → 入队
 ```
 
-这种做法没有在 handler 的同步 Rust 栈上保存 continuation，也没有改变 vsched2 的 TrapInfo 接口。
+`585b86d` 的这一主路径与我们的适配一致，但目前仍有两个边界：
+
+1. 当前 handler 只接受旧状态为 `Blocked`，其它状态统一 panic。wait4 Waker 在 `handle()` 返回前把任务改成 `Ready` 时，实测触发 `trap_handler: task state is not Blocked!`；`exit/exit_group` 合法设置 `Exited` 时也会进入同一 panic。正确协议至少要区分 `Blocked → Ready`、已经由其它路径入队的 `Ready` 和不再入队的 `Exited`。
+2. 原 wait4 方案依赖 `SyscallOutcome::Pending + Waker` 阻止 handler 自动恢复用户任务；这与新版“同步 trap 完成后统一 Ready”冲突，形成高频 replay、重复入队或状态断言失败。不能再靠 TaskState 隐式表达 syscall completion。
+
+下一步回到统一执行流设计：
+
+```text
+SyncRoot + block_on：兼容现有同步 StarryOS 调用链
+FutureRoot + await：vsched2/async-os 原生目标
+可能阻塞的 syscall：迁移期作为普通 SyscallFlow，不能占用共享 TrapHandlerFlow
+```
+
+简化总览见 `core/src/vsched/block_on设计简述.md`，完整分析见 `core/src/vsched/block_on设计文档.md`。
+
+> 说明：第 2～5 节记录了 `585b86d` 之前 wait4 replay 方案的实现与历史验证，当前不再代表最终方案；保留这些内容用于追踪回归原因。
 
 ## 2. vsched2 最小修改
 

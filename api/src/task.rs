@@ -5,7 +5,7 @@ use core::{
 
 use axerrno::{AxError, AxResult};
 use axhal::uspace::{ExceptionKind, ReturnReason, UserContext};
-use axtask::{AxTaskRef, TaskInner, TaskState as AxTaskState, current, spawn_task, vsched2_active};
+use axtask::{AxTaskRef, TaskInner, current, spawn_task, vsched2_active};
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::general::ROBUST_LIST_LIMIT;
 use ringbuf::Arc;
@@ -343,8 +343,6 @@ fn vsched_trap_dispatcher(trapped_task: *const VschedTaskImpl) {
     // Store the actual user task being serviced to use for page fault resolution.
     static LAST_ECALL_USER_TASK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-    vti.task.set_state(AxTaskState::Running);
-
     match tf.scause {
         // Timer interrupt: handled by stub (stimecmp reset), just ignore here
 // if n < 5 { axlog::ax_println!("[stats] timer={}", n+1); }
@@ -367,11 +365,6 @@ fn vsched_trap_dispatcher(trapped_task: *const VschedTaskImpl) {
 
             // Store user task for page fault fallback
             LAST_ECALL_USER_TASK.store(trapped_task as usize, Ordering::Release);
-
-            // Set AXTask to Running so handle_syscall operations
-            // (do_exit, yield_now, block_on) see consistent state.
-            // vsched2 manages vsched-level state; this sets AxRunQueue state.
-            vti.task.set_state(AxTaskState::Running);
 
             // Set the active scope to the user task's scope so
             // scope-local variables (FD_TABLE etc.) resolve correctly.

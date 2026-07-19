@@ -210,6 +210,18 @@ extern "C" fn vsched_yield_entry_stub(tf_stack: *const UserTrapFrame) -> ! {
         let vti = unsafe { &*(current_task as *const VschedTaskImpl) };
         // handler会频繁yield；复用任务自己的稳定frame，避免每次yield泄漏一个Box。
         save_task_trap_frame(vti, tf_stack);
+
+        // vsched2 requires a voluntary yield to publish Ready before the
+        // context is saved.  Preserve Blocking so a blocking reschedule is
+        // committed to Blocked by thread_entry_phase2 instead.
+        use libvsched2::{Task as _, TaskState};
+        vti.match_set_state(
+            TaskState::Ready,
+            TaskState::Ready,
+            TaskState::Blocked,
+            TaskState::Exited,
+            TaskState::Blocking,
+        );
     }
 
     let entry = unsafe {

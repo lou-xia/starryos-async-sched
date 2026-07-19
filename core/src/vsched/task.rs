@@ -76,9 +76,24 @@ impl libvsched2::Task for VschedTaskImpl {
     }
 
     fn set_state(&self, state: libvsched2::TaskState) -> libvsched2::TaskState {
-        let old = to_vsched_state(self.task.state());
-        self.task.set_state(from_vsched_state(state));
-        old
+        to_vsched_state(self.task.swap_state(from_vsched_state(state)))
+    }
+
+    fn match_set_state(
+        &self,
+        state_from_ready: libvsched2::TaskState,
+        state_from_running: libvsched2::TaskState,
+        state_from_blocked: libvsched2::TaskState,
+        state_from_exited: libvsched2::TaskState,
+        state_from_blocking: libvsched2::TaskState,
+    ) -> libvsched2::TaskState {
+        to_vsched_state(self.task.match_set_state(
+            from_vsched_state(state_from_ready),
+            from_vsched_state(state_from_running),
+            from_vsched_state(state_from_blocked),
+            from_vsched_state(state_from_exited),
+            from_vsched_state(state_from_blocking),
+        ))
     }
 
     fn priority(&self) -> isize {

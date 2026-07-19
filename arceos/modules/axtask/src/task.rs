@@ -39,6 +39,11 @@ pub enum TaskState {
     Blocked = 3,
     /// Task is exited and waiting for being dropped.
     Exited  = 4,
+    /// Task has requested blocking, but its context has not been fully saved yet.
+    ///
+    /// This intermediate state is used by vsched2 to make the transition from
+    /// a running task to a blocked task atomic with respect to concurrent wakeups.
+    Blocking = 5,
 }
 
 /// User-defined task extended data.
@@ -116,6 +121,7 @@ impl From<u8> for TaskState {
             2 => Self::Ready,
             3 => Self::Blocked,
             4 => Self::Exited,
+            5 => Self::Blocking,
             _ => unreachable!(),
         }
     }
@@ -328,6 +334,46 @@ impl TaskInner {
     #[inline]
     pub fn set_state(&self, state: TaskState) {
         self.state.store(state as u8, Ordering::Release)
+    }
+
+    /// Atomically replaces the current task state and returns the old state.
+    #[inline]
+    pub fn swap_state(&self, state: TaskState) -> TaskState {
+        self.state.swap(state as u8, Ordering::AcqRel).into()
+    }
+
+    /// Atomically changes the task state according to its current value and
+    /// returns the state observed before the change.
+    ///
+    /// The argument order follows the five-state model used by vsched2.  This
+    /// keeps the comparison and update in one atomic operation, which is
+    /// required when a task is woken while it is committing a block.
+    #[inline]
+    pub fn match_set_state(
+        &self,
+        state_from_ready: TaskState,
+        state_from_running: TaskState,
+        state_from_blocked: TaskState,
+        state_from_exited: TaskState,
+        state_from_blocking: TaskState,
+    ) -> TaskState {
+        let mut old = self.state.load(Ordering::Acquire);
+        loop {
+            let new = match TaskState::from(old) {
+                TaskState::Ready => state_from_ready,
+                TaskState::Running => state_from_running,
+                TaskState::Blocked => state_from_blocked,
+                TaskState::Exited => state_from_exited,
+                TaskState::Blocking => state_from_blocking,
+            } as u8;
+            match self
+                .state
+                .compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(previous) => return previous.into(),
+                Err(actual) => old = actual,
+            }
+        }
     }
 
     /// Transition the task state from `current_state` to `new_state`,

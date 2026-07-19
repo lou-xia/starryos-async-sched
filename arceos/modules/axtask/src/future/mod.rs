@@ -62,12 +62,6 @@ pub fn block_on<F: IntoFuture>(f: F) -> F::Output {
     let mut fut = pin!(f.into_future());
 
     if crate::api::vsched2_active() {
-        // vsched2 active: poll + yield loop.
-        // Each yield_now() goes through vsched2's yield trampoline → kschedule.
-        // Use AxWaker so external wakes (child_exit_event, futex, etc.) set the
-        // `woke` flag. The poll_fn (e.g. wait4's check_children) re-checks
-        // state on each iteration. When the child exits, check_children finds
-        // the zombie and returns Ready.
         let curr = current();
         let task = curr.clone();
         let axwaker = AxWaker::new(&task);
@@ -79,12 +73,7 @@ pub fn block_on<F: IntoFuture>(f: F) -> F::Output {
                     let woke = axwaker.woke.lock();
                     if !*woke {
                         drop(woke);
-                        // Set Blocked so vsched2's push_prev_task skips us,
-                        // allowing other processes to run. The wake_by_ref
-                        // path will re-queue us when the event fires.
                         task.set_state(crate::TaskState::Blocked);
-                        // Toggle handler from coroutine → thread so that
-                        // yield's restore_context() can resume our stack frame.
                         let toggle = crate::api::BLOCK_ON_TOGGLE
                             .load(core::sync::atomic::Ordering::Acquire);
                         if toggle != 0 {
@@ -92,7 +81,6 @@ pub fn block_on<F: IntoFuture>(f: F) -> F::Output {
                             f();
                         }
                         crate::yield_now();
-                        // Resume: toggle back to coroutine
                         if toggle != 0 {
                             let f: fn() = unsafe { core::mem::transmute(toggle) };
                             f();
