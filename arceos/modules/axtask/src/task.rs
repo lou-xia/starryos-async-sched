@@ -206,6 +206,23 @@ impl TaskInner {
         self.ctx.get_mut()
     }
 
+    /// Runs this task's entry closure after an external scheduler has installed
+    /// it as the current task and switched to its kernel stack.
+    ///
+    /// Unlike [`task_entry`], this helper returns after the closure finishes so
+    /// the external scheduler can commit its own task-exit protocol.
+    pub(crate) fn run_entry_for_external_scheduler(&self) {
+        #[cfg(feature = "tls")]
+        unsafe {
+            axhal::asm::write_thread_pointer(self.tls.tls_ptr() as usize)
+        };
+        #[cfg(feature = "irq")]
+        axhal::asm::enable_irqs();
+        if let Some(entry) = self.entry.take() {
+            entry()
+        }
+    }
+
     /// Returns the top address of the kernel stack.
     #[inline]
     pub const fn kernel_stack_top(&self) -> Option<VirtAddr> {

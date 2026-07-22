@@ -47,8 +47,14 @@ impl libvsched2::Stack for VschedStackImpl {
     }
 
     fn dealloc(&mut self) {
+        assert_eq!(
+            self.magic, VSI_MAGIC,
+            "VschedStackImpl::dealloc: invalid or already freed stack",
+        );
         let (total_layout, _) = stack_allocation_layout();
         let ptr = self as *mut Self as *mut u8;
+        self.magic = 0;
+        self.base = core::ptr::null_mut();
         unsafe { dealloc(ptr, total_layout); }
     }
 

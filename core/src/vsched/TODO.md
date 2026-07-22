@@ -272,6 +272,112 @@ Hello, World!
 
 ## 6. 当前边界与后续计划
 
+### 已完成：StarryOS 接口契约修复（2026-07-21）
+
+本轮逐项对照了 vsched2 的 `Task / Stack / Context / TrapInfo / SMP / VSpace / UserData` 约定，修复均位于 StarryOS，没有修改 vsched2，也没有改动 block_on、TrapHandler continuation 或用户态 yield 方案。
+
+已完成内容：
+
+1. `Task::is_kernel()` 与 `Task::pid()` 已解耦。`is_kernel` 只表示运行特权级，`pid` 只表示所属地址空间，因此现在可以表达短期方案需要的 `SyscallTask { is_kernel=true, pid=user_pid }`。
+2. 普通内核线程注册时统一分配 vsched2 `Stack`，并构造首次进入 axtask entry closure 的初始 frame；每次恢复普通内核线程时同步安装对应的 per-CPU `axtask::current()`，避免两个内核线程交替运行时看到陈旧 current。该通用入口已通过编译，但仍需在真正引入 SyscallTask 后做运行测试。
+3. `TrapInfo::handle(Some/None)` 已按约定实现：同步 trap 使用 `Some(task)`，外部中断使用 `None`；`TrapInfo` 自身持有完整、不可变的 `UserTrapFrame` 快照，dispatcher 不再用任务中可能被后续 trap 覆盖的 frame 判断本次事件。实际 syscall 返回值仍写入任务的稳定 resume frame。
+4. `LAST_TRAPPED_USER_TASK` 和 `TRAPPED_VSCHED_TASK` 只在对应 dispatcher 活跃期间保存，并使用 compare-exchange 清除，降低陈旧裸指针被后续 trap 误用的风险。
+5. `CURRENT_VDSO_BASE`、`TRAPPED_VSCHED_TASK`、`LAST_TRAPPED_USER_TASK`、`HANDLER_STACK` 的长度统一改用 `axconfig::plat::CPU_NUM`；`SMP::cpu_id()` 增加越界断言。真正启用多核前仍需核对 StarryOS 与 vsched2 的编译期 `CPU_NUM` 完全一致，并做并发时序测试。
+6. `Stack::dealloc()` 增加 magic 校验和释放前失效处理；`Context::into_user_context()` 对空任务、空 frame、`SPP != 0` 和非法用户 `sepc` 改为明确断言，不再静默自旋或意外返回 S 态。
+7. init/clone 传给 `process_init()` 的 `AddrSpace*` 已直接使用稳定地址，删除了没有所有权意义且不会释放的 `Box<*mut AddrSpace>` 包装。
+8. `VSpace::dealloc()` 保持 no-op，但所有权约定已经明确：传入 vsched2 的指针借用自 `ProcessData`，vsched2 没有取得额外 `Arc` 强引用；`process_drop()` 释放 scheduler slot，地址空间仍由 `ProcessData` 回收。
+
+#### `UserData` 的上游约定不一致
+
+接口注释规定 `Some(vspace)` 是 OS 定义的地址空间指针，但 vsched2 当前的 `current::get_user_data()` 会把 `None` 改写为：
+
+```text
+Some(CURRENT_VSPACE as *mut ())
+```
+
+这里实际传入的是 pid 小整数。若 StarryOS 严格把它解释为 `AddrSpace*`，启动时会在 `get_user_data()` 访问地址 `0x79` 并触发 load page fault。
+
+当前兼容策略是：
+
+- `Some(kernel pointer)`：按显式 `AddrSpace*` 查询每一页，验证完整范围可访问且物理映射连续，再返回 KVA；
+- `Some(small pid)` 或 `None`：按当前已激活地址空间处理，通过 per-CPU `CURRENT_VDSO_BASE` 得到 UVA；
+- vVAR 仍直接返回内核共享映射。
+
+长期应由 vsched2 统一接口注释和 `current::get_user_data()` 的实际参数语义；在上游统一前不能删除 small-pid 兼容。
+
+#### 本轮明确保留的接口边界
+
+- `Task::dealloc()` 仍为 no-op。wait4 Waker 和 vsched2 StackHandler 仍可能保存任务/栈裸指针，直接回收会制造 use-after-free；需要与 block/waker 生命周期一起设计 deferred reclaim，本轮不处理。
+- `HANDLER_STACK` 虽已改成 per-CPU 数组，但每 CPU 仍只有一个槽，多个 handler 会互相覆盖。这属于现有 `BLOCK_ON_TOGGLE`/handler continuation 设计，本轮不处理。
+- `VSpace::dealloc()` 的 no-op 是当前借用式所有权协议，不是遗漏；若以后希望 vsched2 独立持有地址空间，需要把传入值改成拥有引用计数的句柄并成对释放。
+
+#### 最新运行验证
+
+最新镜像已重新到达：
+
+```text
+Welcome to Starry OS!
+[clone] push_task pid=2, ok=true
+[wait4] PENDING ...
+```
+
+严格解释 `UserData` 时出现的 `stval=0x79`、`sepc=get_user_data` 页错误已消失，也没有再次出现由该错误引起的 `no thread, no last user`。随后系统停在已知问题：
+
+```text
+panic in vDSO: trap_handler: task state is not Blocked!
+```
+
+该停止点属于暂缓处理的 block_on/TrapHandler 状态问题，因此本轮最新镜像尚未重新到达 `Hello, World!`；不能把这次 timeout 记为完整功能验证通过。
+
+`make test` 的用户测试程序构建、复制到 `disk.img` 和内核 release 构建均成功；QEMU 运行同样在上述已知断言处停止，验证方随后主动中断 QEMU。因此本轮 `make test` 只能记为“构建阶段通过、运行阶段被已知 block_on/handler 问题阻断”。
+
+### P0：用户线程尚不能通过 `utask_schedule()` 在 U 模式直接切换
+
+预期场景是：
+
+```text
+同一地址空间中的用户线程 A
+  → yield → 用户态 uschedule/utask_schedule → 线程 B
+  → yield → 用户态 uschedule/utask_schedule → 线程 A
+```
+
+当前 StarryOS **不能满足**。现有实际流程是：
+
+```text
+A 执行 Linux sched_yield ecall
+  → 进入内核 TrapHandler
+  → sys_sched_yield() 调用 axtask::yield_now()
+  → 内核 vsched_yield_trampoline
+  → raw_thread_entry → kschedule
+  → 内核选择 B 所在的用户 Scheduler
+  → krun_utask → into_user_context → sret 到 B
+
+B 再次 sched_yield
+  → 重复进入内核和 kschedule
+```
+
+这里 yield 时，`axtask::with_current_task()` 只临时替换 axtask 的 current；vsched2 的 `CURRENT_TASK` 仍是共享 TrapHandler，`IN_KERNEL` 也为 true。因此被保存和让权的是内核 handler，不是用户线程 A，分支只能进入 `kschedule`，不会进入 `uschedule/utask_schedule`。而且 handler 仍标记为 coroutine 时在 syscall 内普通 yield，会丢失当前 `TrapInfo::handle()` continuation，不能作为用户 yield 的桥。
+
+即使为用户程序增加对 `raw_thread_entry` 的直接调用，当前仍有以下闭环缺口：
+
+1. Linux `sched_yield` 本身是 ecall；若要完全不陷入内核，需要 libc/用户运行时改为调用用户 vDSO yield 入口，同时保留 syscall fallback。
+2. StarryOS 的 `Task::resched()` 只会进入内核地址的 `vsched_yield_trampoline`，并保存 S 模式 frame（`SPP=1`），没有 U 模式线程上下文保存入口。
+3. 用户 vDSO 的 `Task_TABLE` 等 trait vtable 位于每进程私有 `.bss`，当前只初始化了内核 vDSO 副本；其中需要的 StarryOS 回调又是内核代码地址，U 模式不能调用。
+4. `Scheduler::init_sources()` 当前从内核 vDSO 执行，写入用户 Scheduler 的 `EventSourceVtable` 函数指针也是内核 vDSO 地址；字段偏移解决了 KVA/UVA 数据自引用，但没有解决函数指针的地址基址。
+5. 用户任务对象是内核堆中的 `VschedTaskImpl/AxTaskRef`，`trap_frame` 和 `thread_stack_ptr` 也指向内核对象；U 模式 vDSO 无法直接调用其状态、优先级和上下文接口。
+6. 当前 `Stack::alloc()` 只分配内核堆栈，不能作为 `Context::into_user()` 传入的 U 模式协程栈。
+7. vsched2 的 `thread_entry()` 会调用 RISC-V `assert_disable_irq()` 读取 `sstatus`，而 U 模式不能访问 S 态 CSR；同时 `raw_thread_entry` 注释要求关中断进入，普通 U 模式代码也无法直接满足该前提。
+
+因此，当前的“用户 Scheduler 已初始化、内核可从中取出用户任务”不等于“用户 Scheduler 已能在 U 模式自行运行”。要实现预期场景，需要先确定并与 vsched2 对齐一套真正的用户态 ABI：
+
+1. 增加 U 模式可调用的 yield/context-save 入口，保存 A 的用户线程上下文并在进入 `raw_thread_entry` 前把 A 置为 Ready；
+2. 为用户侧提供 U 可访问的最小 Task/Context/Stack 表示和 U 地址函数入口，不能直接暴露 `AxTaskRef` 或内核函数指针；
+3. 将用户 Scheduler 的事件源 vtable 按用户 vDSO 基址初始化，或改成与字段相同的相对偏移；
+4. 拆分 `thread_entry` 的内核/用户前置条件，用户路径不能读取 S 态 CSR，也不能依赖 U 模式自行关 S 中断；
+5. 完成后新增同地址空间两个线程反复 yield 的专门测试，并用日志断言：第一次进入用户调度循环后，同 pid 切换不出现 ecall `0xdead`，只有选中内核 Scheduler 或其它 pid 时才通过 `Context::into_kernel()` 陷入内核。
+
+在上述闭环完成前，迁移期应明确接受 `sched_yield → trap → kschedule` 的内核调度路径，不能把当前状态描述为已经使用了 `utask_schedule`。
+
 ### 已完成：任务指针 Waker 的 stale 保护
 
 `VschedTaskImpl` 新增 `wake_generation`。Waker 创建时同时保存：
@@ -292,7 +398,7 @@ WeakAxTaskRef 仍可 upgrade
 
 当前 `VschedTaskImpl::dealloc()` 仍为 no-op，所以裸指针物理生命周期尚未结束。将来真正回收 `VschedTaskImpl` 时，仍需把 Waker target 改为拥有引用计数的独立对象，不能只依靠 generation。
 
-多核下 Blocked → Ready 还需要真正的 compare-exchange 状态接口，当前单核实现不宣称已经解决该并发问题。
+`Task::match_set_state()` 已由 axtask 的 CAS 循环实现原子状态转换；但 Waker 的队列插入/失败回滚、任务裸指针生命周期和跨 CPU 入队仍未完成多核验证，当前不能据此宣称阻塞唤醒已经支持多核。
 
 ### 已完成：自动日志断言和日志收敛
 
@@ -406,10 +512,12 @@ todo!("用户态中断处理流程")
 5. ✅ Waker 增加 `WeakAxTaskRef + wake_generation + TaskState` stale 保护；
 6. ✅ 增加 `make verify-vsched2` 自动日志断言，并清理 StarryOS 高频临时日志；
 7. ✅ 审计通用 `block_on` coroutine 方案和全部调用点；当前验证路径无需迁移其它 syscall；
-8. ⏳ 修复 init 任务退出后的 bootstrap/SBI shutdown 生命周期；
-9. ⏳ 独立实现并测试同优先级公平策略；
-10. ⏳ 处理用户态中断与资源回收；
-11. ⏳ 开始多核验证。
+8. ✅ 修复 StarryOS 的 vsched2 接口实现与约定问题；保留与 block/waker 生命周期绑定的回收项；
+9. ⏳ 继续讨论并修复 block_on/TrapHandler 状态问题；
+10. ⏳ 修复 init 任务退出后的 bootstrap/SBI shutdown 生命周期；
+11. ⏳ 独立实现并测试同优先级公平策略；
+12. ⏳ 处理用户态中断与资源回收；
+13. ⏳ 开始多核验证。
 
 ## 8. 已解决历史问题摘要
 
@@ -424,7 +532,12 @@ todo!("用户态中断处理流程")
 | yield 每次泄漏 trap-frame Box | ✅ 原位复用 |
 | execve 新 vDSO Scheduler 未初始化 | ✅ 已有 process API 组合 |
 | `Welcome to Starry OS!` | ✅ 当前验证 |
-| `Hello, World!` | ✅ 当前验证 |
+| `Hello, World!` | ✅ 历史版本已验证；最新版本被已知 handler 状态问题提前阻断 |
 | vDSO 日志 `config.log=true` | ✅ template 自动初始化日志桥 |
 | vDSO panic 无输出 | ✅ template panic 日志 |
 | `make test` 复制整个 target 导致 ENOSPC | ✅ 只复制 release 顶层可执行文件 |
+| `Task::is_kernel()` 错误依赖 `pid == 0` | ✅ 独立特权级字段 |
+| 普通内核线程无法首次进入/恢复 axtask entry | ✅ 初始 frame + external-current 桥 |
+| `TrapInfo::handle()` 忽略 `Some/None` 且快照不稳定 | ✅ Option 语义 + 完整 frame 快照 |
+| `UserData` 把 vsched2 传入的小整数 pid 当指针 | ✅ 临时兼容 pointer/pid 两种实际调用 |
+| StarryOS vsched per-CPU 数组硬编码为 1 | ✅ 改用 `axconfig::plat::CPU_NUM` |

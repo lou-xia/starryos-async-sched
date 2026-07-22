@@ -142,14 +142,18 @@ pub fn new_vsched_user_task(
 
     let tf_ptr = Box::into_raw(tf);
 
-    let vti = starry_core::vsched::register_task(task_ref.clone(), 0, pid, None, vdso_base);
+    let vti = starry_core::vsched::register_task(
+        task_ref.clone(),
+        0,
+        pid,
+        false,
+        None,
+        vdso_base,
+    );
     let vti_ref = unsafe { &*vti };
     vti_ref.trap_frame.store(tf_ptr as usize, Ordering::Release);
     vti_ref.user_page_table_root.store(user_root, Ordering::Release);
     vti_ref.user_aspace_ptr.store(aspace_mutex_ptr, Ordering::Release);
-
-    let stack_ptr = starry_core::vsched::alloc_stack();
-    vti_ref.thread_stack_ptr.store(stack_ptr as usize, Ordering::Release);
 
     // Caller must push the task to the correct scheduler after process_init
     let vti_raw = vti as *const ();
@@ -321,13 +325,30 @@ use starry_core::vsched::task::VschedTaskImpl;
 use axhal::paging::MappingFlags;
 use memory_addr::VirtAddr;
 
-fn vsched_trap_dispatcher(trapped_task: *const VschedTaskImpl) {
+fn vsched_trap_dispatcher(
+    trapped_task: Option<*const VschedTaskImpl>,
+    tf: &UserTrapFrame,
+) {
+    // External interrupts are deliberately unrelated to a task.  The timer
+    // comparator is acknowledged in the low-level trap stub; other interrupt
+    // dispatch can be added here without manufacturing a user-task owner.
+    if tf.scause >> 63 == 1 {
+        return;
+    }
+
+    let Some(trapped_task) = trapped_task else {
+        axlog::warn!(
+            "vsched trap: synchronous trap without task: scause={}, sepc={:#x}",
+            tf.scause,
+            tf.sepc,
+        );
+        return;
+    };
     let vti = unsafe { &*trapped_task };
     let tf_ptr = vti.trap_frame.load(Ordering::Acquire);
     if tf_ptr == 0 {
         return;
     }
-    let tf = unsafe { &*(tf_ptr as *const UserTrapFrame) };
 
     // Use the TRAPPED task for signals, not current() (which is trap handler)
     let mut signal_task = vti.task.clone();
@@ -339,16 +360,8 @@ fn vsched_trap_dispatcher(trapped_task: *const VschedTaskImpl) {
         }
     }
 
-    // For page faults during syscall handling, the trapped task is the handler.
-    // Store the actual user task being serviced to use for page fault resolution.
-    static LAST_ECALL_USER_TASK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-
     match tf.scause {
-        // Timer interrupt: handled by stub (stimecmp reset), just ignore here
-// if n < 5 { axlog::ax_println!("[stats] timer={}", n+1); }
-        sc if sc >> 63 == 1 => {}
-// axlog::ax_println!("[ecall#{}] a7={} a0={:#x} a1={:#x} a2={}", n, a7, tf.regs.a0, tf.regs.a1, tf.regs.a2);
-          8 => {
+        8 => {
             let mut uctx = UserContext::new(
                 tf.sepc + 4,
                 VirtAddr::from(tf.regs.sp),
@@ -362,9 +375,6 @@ fn vsched_trap_dispatcher(trapped_task: *const VschedTaskImpl) {
             uctx.set_sysno(tf.regs.a7);
             uctx.set_ra(tf.regs.ra);
             uctx.set_tls(tf.regs.tp);
-
-            // Store user task for page fault fallback
-            LAST_ECALL_USER_TASK.store(trapped_task as usize, Ordering::Release);
 
             // Set the active scope to the user task's scope so
             // scope-local variables (FD_TABLE etc.) resolve correctly.
@@ -382,6 +392,8 @@ fn vsched_trap_dispatcher(trapped_task: *const VschedTaskImpl) {
             let syscall_outcome = axtask::with_current_task(&vti.task, || {
                 handle_syscall(&mut uctx)
             });
+
+            starry_core::vsched::clear_trapped_vsched_task(trapped_task as *const ());
 
             drop(scope_guard);
             scope_local::ActiveScope::set_global();

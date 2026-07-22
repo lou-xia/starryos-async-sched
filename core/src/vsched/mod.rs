@@ -1,8 +1,3 @@
-use alloc::{
-    boxed::Box,
-    string,
-    sync::Arc,
-};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use axhal::asm;
@@ -46,7 +41,7 @@ pub static KERNEL_KSCHEDULER: AtomicUsize = AtomicUsize::new(0);
 /// 当前正在被 trap_handler 服务的用户任务（vsched2 指针）。
 /// dispatch 时写入，mark_exited 时读取。不被 vsched2 CURRENT_TASK 覆盖。
 /// per-CPU 数组，每核心独立。
-const CPU_NUM: usize = 1;
+const CPU_NUM: usize = axconfig::plat::CPU_NUM;
 pub static TRAPPED_VSCHED_TASK: [AtomicUsize; CPU_NUM] = [const { AtomicUsize::new(0) }; CPU_NUM];
 
 pub const HIGHEST_PRIORITY: isize = 0;
@@ -198,6 +193,18 @@ pub fn trapped_vsched_task() -> *const () {
         .load(Ordering::Acquire) as *const ()
 }
 
+/// Clears the currently serviced user task after the syscall dispatcher
+/// returns.  Compare-exchange avoids erasing a newer nested association.
+pub fn clear_trapped_vsched_task(task: *const ()) {
+    let slot = &TRAPPED_VSCHED_TASK[<smp::VschedSmpImpl as libvsched2::SMP>::cpu_id()];
+    let _ = slot.compare_exchange(
+        task as usize,
+        0,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+}
+
 /// 分配一个用于 vsched2 的 Stack 对象
 pub fn alloc_stack() -> *mut () {
     stack::VschedStackImpl::alloc()
@@ -211,7 +218,7 @@ pub fn set_vsched_task_exited(task: *const ()) {
     vti.set_state(libvsched2::TaskState::Exited);
 }
 
-pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace_ptr: Option<*mut *mut ()>) -> ! {
+pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace: Option<*mut ()>) -> ! {
     axhal::asm::disable_irqs();
     init_vsched2_interfaces();
 
@@ -228,12 +235,12 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace_ptr: Option<*m
     axtask::init_run_queue_empty();
 
     let curr = axtask::current();
-    let main_ptr = register_task(curr.clone(), LOWEST_PRIORITY, 0, None, 0);
-    // 分配一个 Stack 对象作为内核主任务的初始栈
-    let init_stack_ptr = alloc_stack();
-    unsafe { (main_ptr as *mut VschedTaskImpl).as_mut().unwrap() }
+    let main_ptr = register_task(curr.clone(), LOWEST_PRIORITY, 0, true, None, 0);
+    // register_task 为线程统一分配 Stack 对象，内核初始化还需要把它
+    // 作为当前栈交给 vsched2。
+    let init_stack_ptr = unsafe { &*main_ptr }
         .thread_stack_ptr
-        .store(init_stack_ptr as usize, Ordering::Release);
+        .load(Ordering::Acquire) as *mut ();
 
     unsafe {
         libvsched2::VDSO_VTABLE
@@ -241,9 +248,8 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace_ptr: Option<*m
             .expect("kernel_init_main not in vtable")(init_stack_ptr, main_ptr as *const ());
     }
 
-    if let (Some(init_task_ptr), Some(vspace_ptr)) = (init_task_ptr, vspace_ptr) {
+    if let (Some(init_task_ptr), Some(aspace_ptr)) = (init_task_ptr, vspace) {
         let kernel_root = unsafe { asm::read_user_page_table() };
-        let aspace_ptr = unsafe { *vspace_ptr };
         if !aspace_ptr.is_null() {
             let aspace = unsafe { &*(aspace_ptr as *const axmm::AddrSpace) };
             let root = aspace.page_table_root();
@@ -295,13 +301,12 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace_ptr: Option<*m
 // axlog::ax_println!("vsched2: calling process_init...");
         }
 // axlog::ax_println!("vsched2: process_init pid={}", pid);
-        let pid = libvsched2::process_init(unsafe { *vspace_ptr });
+        let pid = libvsched2::process_init(aspace_ptr);
 // axlog::ax_println!("[verify] vdso_pa={:#x} user_vdso_base={:#x}",
         // --- Verification ---
         // user_init must run with the user PT active so that &USER_SCHEDULER
         // inside init_sources resolves to the user vDSO copy.  We call
         // user_init_with_vspace which translates the address to kva.
-        let aspace_ptr = unsafe { *vspace_ptr };
         libvsched2::user_init(aspace_ptr);
         libvsched2::push_task_into_process(init_task_ptr, pid);
         unsafe {
@@ -311,8 +316,7 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace_ptr: Option<*m
     }
 
     // Sync any new kernel mappings from process_init into user PT.
-    if let Some(vspace_ptr) = vspace_ptr {
-        let aspace_ptr = unsafe { *vspace_ptr };
+    if let Some(aspace_ptr) = vspace {
         if !aspace_ptr.is_null() {
             let mut user_aspace = unsafe { &mut *(aspace_ptr as *mut axmm::AddrSpace) };
             let kernel_aspace = axmm::kernel_aspace().lock();

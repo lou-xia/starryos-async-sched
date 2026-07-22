@@ -36,7 +36,7 @@ const USE_VSCHED2: bool = true;
 
 pub const CMDLINE: &[&str] = &["/bin/sh", "-c", include_str!("init.sh")];
 
-fn create_vsched_init_task(args: &[String], envs: &[String]) -> (*const starry_core::vsched::VschedTaskImpl, *mut *mut ()) {
+fn create_vsched_init_task(args: &[String], envs: &[String]) -> (*const starry_core::vsched::VschedTaskImpl, *mut ()) {
     let mut uspace = new_user_aspace_empty()
         .and_then(|mut it| {
             copy_from_kernel(&mut it)?;
@@ -77,10 +77,9 @@ fn create_vsched_init_task(args: &[String], envs: &[String]) -> (*const starry_c
         None,
     );
     // 获取 AddrSpace 的稳定指针（AddrSpace 存储在 Mutex 内部，Mutex 在 Arc 中，生命周期安全）
-    let vspace_ptr = {
+    let vspace = {
         let guard = proc_data.aspace.lock();
-        let p: *mut () = &raw const *guard as *mut ();
-        Box::into_raw(Box::new(p))
+        &raw const *guard as *mut ()
     };
     // 保存用户页表根，稍后存入 VschedTaskImpl
     let user_root = proc_data.aspace.lock().page_table_root();
@@ -120,14 +119,18 @@ fn create_vsched_init_task(args: &[String], envs: &[String]) -> (*const starry_c
     tf.regs.ra = 0;
     let tf_ptr = Box::into_raw(tf);
 
-    let vti = starry_core::vsched::register_task(task_ref.clone(), 0, 1, None, init_vdso_base);
-    // 为 init 任务分配一个 Stack 对象
-    let init_stack_ptr = starry_core::vsched::alloc_stack();
-    unsafe { &*vti }.thread_stack_ptr.store(init_stack_ptr as usize, Ordering::Release);
+    let vti = starry_core::vsched::register_task(
+        task_ref.clone(),
+        0,
+        1,
+        false,
+        None,
+        init_vdso_base,
+    );
     unsafe { &*vti }.trap_frame.store(tf_ptr as usize, Ordering::Release);
     unsafe { &*vti }.user_page_table_root.store(user_root.as_usize(), Ordering::Release);
     unsafe { &*vti }.user_aspace_ptr.store(aspace_mutex_ptr, Ordering::Release);
-    (vti, vspace_ptr)
+    (vti, vspace)
 }
 
 #[unsafe(no_mangle)]
@@ -144,8 +147,8 @@ fn main() {
     // axlog::ax_println!("main: USE_VSCHED2={} args={:?}", USE_VSCHED2, args);
 
     if USE_VSCHED2 {
-        let (init_ptr, vspace_ptr) = create_vsched_init_task(&args, envs);
-        starry_core::vsched::vsched2_bootstrap(Some(init_ptr as *const ()), Some(vspace_ptr));
+        let (init_ptr, vspace) = create_vsched_init_task(&args, envs);
+        starry_core::vsched::vsched2_bootstrap(Some(init_ptr as *const ()), Some(vspace));
     } else {
         entry::run_initproc(&args, envs);
     }

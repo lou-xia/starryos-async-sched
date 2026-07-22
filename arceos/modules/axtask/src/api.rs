@@ -242,6 +242,37 @@ pub fn with_current_task<R>(task: &AxTaskRef, f: impl FnOnce() -> R) -> R {
     result
 }
 
+/// Installs `task` as the axtask current task without using `AxRunQueue`.
+///
+/// External schedulers must call this whenever they restore a kernel thread,
+/// otherwise two externally scheduled threads can observe the same stale
+/// per-CPU `axtask::current()` value.
+pub fn install_current_task_for_external_scheduler(task: &AxTaskRef) {
+    let old_ptr = axhal::percpu::current_task_ptr::<super::AxTask>();
+    let target_ptr = Arc::as_ptr(task);
+
+    if old_ptr != target_ptr {
+        let new_ptr = Arc::into_raw(task.clone());
+        unsafe { axhal::percpu::set_current_task_ptr(new_ptr) };
+        if !old_ptr.is_null() {
+            // SAFETY: the per-CPU current-task pointer owns one strong Arc
+            // reference, established by init_current/set_current or this bridge.
+            unsafe { drop(Arc::from_raw(old_ptr)) };
+        }
+    }
+}
+
+/// Runs the entry closure of an externally scheduled task.
+///
+/// The caller must already have switched to the task's kernel stack.  The
+/// closure is allowed to return; committing the external scheduler's exit
+/// state remains the caller's responsibility.
+pub fn run_task_entry_for_external_scheduler(task: &AxTaskRef) {
+    install_current_task_for_external_scheduler(task);
+
+    task.run_entry_for_external_scheduler();
+}
+
 /// Set the affinity for the current task.
 /// [`AxCpuMask`] is used to specify the CPU affinity.
 /// Returns `true` if the affinity is set successfully.

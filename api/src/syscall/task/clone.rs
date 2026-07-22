@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::Ordering;
 
 use axerrno::{AxError, AxResult};
@@ -234,11 +234,11 @@ pub fn sys_clone(
         if !flags.contains(CloneFlags::THREAD) {
             let thr = task.try_as_thread().expect("vsched2 child must have thread");
             let saved_root = axhal::asm::read_user_page_table();
-            let (child_root, vspace_ptr): (_, *mut *mut ()) = {
+            let (child_root, vspace): (_, *mut ()) = {
                 let guard = thr.proc_data.aspace.lock();
                 let root = guard.page_table_root();
                 let p: *mut () = &raw const *guard as *mut ();
-                (root, Box::into_raw(Box::new(p)))
+                (root, p)
             };
 
             // Give the child its own vDSO/VVAR pages.  After
@@ -276,8 +276,7 @@ pub fn sys_clone(
                     }
                 }
 
-                let aspace_ptr = unsafe { *vspace_ptr };
-                let new_vdso = starry_core::vsched::map_vdso_for_child(aspace_ptr);
+                let new_vdso = starry_core::vsched::map_vdso_for_child(vspace);
                 {
                     let mut guard = thr.proc_data.aspace.lock();
                     guard.vdso_base = new_vdso as usize;
@@ -310,10 +309,10 @@ pub fn sys_clone(
                 }
             }
 
-            let child_pid = starry_core::vsched::process_init(unsafe { *vspace_ptr });
+            let child_pid = starry_core::vsched::process_init(vspace);
             unsafe { &*(vti_ptr as *const starry_core::vsched::VschedTaskImpl) }
                 .pid.store(child_pid, Ordering::Release);
-            starry_core::vsched::user_init_with_vspace(unsafe { *vspace_ptr });
+            starry_core::vsched::user_init_with_vspace(vspace);
             let pushed = starry_core::vsched::push_task_into_process(vti_ptr, child_pid);
             axlog::ax_println!("[clone] push_task pid={}, ok={}", child_pid, pushed);
         }

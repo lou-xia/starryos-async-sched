@@ -12,7 +12,7 @@ use super::{task::VschedTaskImpl, trapframe::UserTrapFrame};
 pub struct VschedContextImpl;
 pub struct VschedVSpaceImpl;
 
-const CPU_NUM: usize = 1;
+const CPU_NUM: usize = axconfig::plat::CPU_NUM;
 
 /// 将用户页表根写入 SATP，并刷新 TLB、设置 SUM 位。
 pub fn activate_user_aspace(root: PhysAddr) {
@@ -133,15 +133,22 @@ impl libvsched2::Context for VschedContextImpl {
     }
 
     fn into_user_context(task: *const ()) {
+        assert!(!task.is_null(), "into_user_context: task is null");
         let vsched_task = unsafe { &*(task as *const VschedTaskImpl) };
         let tf_ptr = vsched_task.trap_frame.load(Ordering::Acquire);
         assert_ne!(tf_ptr, 0, "into_user_context: trap_frame is null");
         let tf = unsafe { &*(tf_ptr as *const UserTrapFrame) };
         let spp = (tf.sstatus >> 8) & 1;
 // axlog::ax_println!(
-        if spp == 0 && tf.sepc >= 0xffffffc000000000 {
-            loop { core::hint::spin_loop(); }
-        }
+        assert_eq!(
+            spp, 0,
+            "into_user_context: frame would return to supervisor mode",
+        );
+        assert!(
+            tf.sepc < 0xffffffc000000000,
+            "into_user_context: user frame points into kernel: sepc={:#x}",
+            tf.sepc,
+        );
         // into_vspace already switched SATP to user PT. Load regs and sret.
         unsafe { tf.restore_and_sret() };
     }
@@ -161,6 +168,9 @@ impl libvsched2::VSpace for VschedVSpaceImpl {
     }
 
     fn dealloc(&self) {
-        // No-op: address space lifecycle managed by ProcessData Arc.
+        // The pointer registered in process_init is borrowed from the
+        // ProcessData-owned Arc<Mutex<AddrSpace>>; vsched2 did not acquire a
+        // separate strong reference.  process_drop therefore only releases
+        // the scheduler slot, while ProcessData remains the sole owner.
     }
 }

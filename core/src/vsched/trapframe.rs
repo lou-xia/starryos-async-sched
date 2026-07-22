@@ -15,6 +15,7 @@
 //! 跳转。GPR 恢复仅覆盖 offset 0~248，sepc 在 offset 256 处始终完好。无需暂存。
 
 #[repr(C)]
+#[derive(Clone, Copy, Default)]
 pub struct UserGeneralRegs {
     pub zero: usize,
     pub ra: usize,
@@ -61,6 +62,7 @@ pub enum UserTrapFrameKind {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct UserTrapFrame {
     pub regs: UserGeneralRegs,
     pub sepc: usize,

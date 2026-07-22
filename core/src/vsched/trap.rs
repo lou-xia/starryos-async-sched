@@ -1,6 +1,6 @@
 use alloc::{boxed::Box, sync::Arc};
 use core::{
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicUsize, Ordering},
     task::Poll,
 };
 
@@ -14,9 +14,9 @@ use super::{
 };
 use crate::config;
 
-type TrapDispatcher = fn(trapped_task: *const VschedTaskImpl);
+type TrapDispatcher = fn(Option<*const VschedTaskImpl>, &UserTrapFrame);
 
-const CPU_NUM: usize = 1;
+const CPU_NUM: usize = axconfig::plat::CPU_NUM;
 
 // Last user task being serviced by trap handler (for page fault fallback)
 static LAST_TRAPPED_USER_TASK: [core::sync::atomic::AtomicUsize; CPU_NUM] =
@@ -32,6 +32,17 @@ pub fn get_last_trapped_user_task() -> *const VschedTaskImpl {
         .load(Ordering::Acquire) as *const VschedTaskImpl
 }
 
+/// Clears a cached user task only if it is still the cache owner.
+fn clear_last_trapped_user_task(task: *const VschedTaskImpl) {
+    let slot = &LAST_TRAPPED_USER_TASK[<super::smp::VschedSmpImpl as SMP>::cpu_id()];
+    let _ = slot.compare_exchange(
+        task as usize,
+        0,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+}
+
 static TRAP_DISPATCHER: AtomicUsize = AtomicUsize::new(0);
 
 pub fn register_trap_dispatcher(dispatcher: TrapDispatcher) {
@@ -41,28 +52,18 @@ pub fn register_trap_dispatcher(dispatcher: TrapDispatcher) {
 // ---- TrapInfo implementation ----
 
 pub struct VschedTrapInfoImpl {
-    scause: usize,
-    stval: usize,
-    sepc: usize,
-    trapped_task: usize,
+    /// TrapInfo owns the immutable event snapshot.  The task's stable frame is
+    /// the eventual resume target and may be updated independently.
+    frame: UserTrapFrame,
 }
 
 impl libvsched2::TrapInfo for VschedTrapInfoImpl {
     fn from_task(task: *const ()) -> *const Self {
         let vti = unsafe { &*(task as *const VschedTaskImpl) };
         let tf_ptr = vti.trap_frame.load(Ordering::Acquire);
-        let (scause, stval, sepc) = if tf_ptr != 0 {
-            let tf = unsafe { &*(tf_ptr as *const UserTrapFrame) };
-            (tf.scause, tf.stval, tf.sepc)
-        } else {
-            (0, 0, 0)
-        };
-        Box::into_raw(Box::new(Self {
-            scause,
-            stval,
-            sepc,
-            trapped_task: task as usize,
-        }))
+        assert_ne!(tf_ptr, 0, "TrapInfo::from_task: task has no trap frame");
+        let frame = unsafe { *(tf_ptr as *const UserTrapFrame) };
+        Box::into_raw(Box::new(Self { frame }))
     }
 
     fn handle(&self, task: Option<*const ()>) {
@@ -70,18 +71,21 @@ impl libvsched2::TrapInfo for VschedTrapInfoImpl {
         if dispatcher == 0 {
             return;
         }
-        // Save the last USER (non-coroutine) trapped task for page fault fallback.
-        // Nested traps (handler faults) need the original user task's AddrSpace.
-        let trapped = self.trapped_task as *const VschedTaskImpl;
-        if !trapped.is_null() {
-            let vti = unsafe { &*trapped };
-            if !vti.is_coroutine.load(Ordering::Acquire) {
-                crate::vsched::trap::set_last_trapped_user_task(trapped as *const ());
-            }
+        // `task` is authoritative: vsched2 passes None for external interrupts.
+        let trapped = task.map(|ptr| ptr as *const VschedTaskImpl);
+        // Keep the originating user task available only while its dispatcher is
+        // active, so a nested handler fault can resolve the correct AddrSpace.
+        let cached_user = trapped.filter(|ptr| {
+            let vti = unsafe { &**ptr };
+            !vti.is_kernel()
+        });
+        if let Some(user) = cached_user {
+            set_last_trapped_user_task(user as *const ());
         }
         let dispatcher: TrapDispatcher = unsafe { core::mem::transmute(dispatcher) };
-        if !trapped.is_null() {
-            dispatcher(trapped);
+        dispatcher(trapped, &self.frame);
+        if let Some(user) = cached_user {
+            clear_last_trapped_user_task(user);
         }
     }
 
@@ -111,7 +115,7 @@ impl libvsched2::TrapInfo for VschedTrapInfoImpl {
 // axlog::ax_println!("[new_handler] about to register_task");
         });
 // axlog::ax_println!("[new_handler] DONE ptr={:#x}", ptr as usize);
-        let ptr = register_task(task_ref, HIGHEST_PRIORITY, 0, Some(coro), 0);
+        let ptr = register_task(task_ref, HIGHEST_PRIORITY, 0, true, Some(coro), 0);
         // 为 handler 预分配一个栈，供 toggle 到线程模式时使用
         let handler_stack = super::alloc_stack();
         set_handler_stack(handler_stack as usize);

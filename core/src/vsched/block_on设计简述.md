@@ -16,48 +16,55 @@
 
 ## 2. 短期方案
 
-不重写现有同步 syscall，只把可能阻塞的调用链从 TrapHandler 中移出去。
+所有 syscall 都交给独立的 SyscallTask 处理，TrapHandler 只负责分发，不再区分“可能阻塞”和“不可能阻塞”。
 
-将系统调用分为两类：可能阻塞的和不可能阻塞的。可能阻塞的指存在等待可能的 syscall，例如 wait、pipe、poll、futex、sleep、TTY、socket 和异步磁盘 I/O。
+SyscallTask 是一个 vsched2 的内核态协程：
 
-需要一个专门处理可能阻塞的系统调用的任务 SyscallTask，它是普通的 vsched2 线程任务，保存所需的进程信息和 trap frame。
+```text
+用户任务 ecall
+    → TrapHandler 保存 trap frame
+    → 创建并入队 async SyscallTask
+    → TrapHandler 立即返回，继续处理其他 TrapInfo
+```
 
-1. 用户任务发起 syscall，变成 blocked 状态
-2. TrapHandler 判断是否是可能阻塞的 Syscall
-3. 如果不是就直接在 TrapHandler 中处理
-4. 如果是就创建 SyscallTask 任务，以线程形式运行
-5. SyscallTask 中调用 block_on(Future)
-6. Future 返回 Pending:  
-    1. 阻塞 SyscallTask，TrapHandler 继续运行
-    2. 等待 Waker 唤醒 SyscallTask 后，重新加入 vsched2 的调度队列
-7. SyscallTask 处理完成，唤醒用户任务
-
-总结而言，就是把用到 block_on 的系统调用创建新的任务调用 block_on，与 TrapHandler 分离。
-
-## 3. 长期方案
-
-将 SyscallTask 转换成协程，通过 vsched2 协程实现整个 syscall 过程，类似 Async-OS 里的 run_task 函数，逐步消除 block_on
-
-短期：
+SyscallTask 的根入口可以写成 `async fn`，但短期内部仍然调用现有的同步 `handle_syscall`。同步函数不需要加 `.await`；它会在 SyscallTask 根 Future 被 poll 时直接执行。
 
 ```rust
-fn syscall_task() {
-    let result = block_on(future());
-    back_to_user(result);
+async fn syscall_task(request: SyscallRequest) -> isize {
+    let result = handle_syscall(&request); // 同步调用
+    complete_syscall(request, result);
+    0
 }
 ```
 
-最终：
+对于不会阻塞的 syscall，`handle_syscall` 直接执行完毕，SyscallTask 一次 poll 就返回 `Ready`。
+
+对于调用 `block_on` 后出现 `Pending` 的 syscall，将 SyscallTask 内主动调用 yield 来实现转换成线程，阻塞等待。当 `block_on` 完成后，SyscallTask 恢复成协程；处理结果写回 trap frame，然后唤醒用户任务。
+
+因此，短期方案中不需要判断 syscall 是否会阻塞，所有 syscall 都走 SyscallTask 就行。
+
+## 3. 最终目标
+
+短期方案完成后，SyscallTask 已经是 vsched2 协程，因此最终不需要再更换一套 SyscallTask 模型。后续只需要按 syscall 类别，逐步将 Syscall 中的：
 
 ```rust
-async fn syscall_coroutine() {
-    let result = future().await;
-    back_to_user(result);
-}
+let result = block_on(future());
 ```
 
-此时，block_on 的参数 future 也作为 vsched2 的协程参与调度。
+改成：
+
+```rust
+let result = future().await;
+```
+
+也就是把 SyscallTask 内的 future 从阻塞线程处理变成状态机处理。这需要逐 syscall 实现 block_on 到 await 的改造。
 
 
 
+递进过程：
 
+```text
+短期：async SyscallTask + 同步 handle_syscall + block_on Pending 时按通过 yield 线程让权
+  ↓ 逐类将 block_on 改为 await
+最终：async SyscallTask +  await
+```
