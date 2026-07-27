@@ -9,10 +9,10 @@
 //! |------|---------|--------|---------|
 //! | `restore_and_sret` | `into_user_context` | S-mode | sepc, sstatus, sret |
 //! | `restore_and_jump(Yield)` | yield 恢复 | U/S 均可 | 无 |
-//! | `restore_and_jump(Trap)` | preemption 恢复 | **仅 S-mode** | 无 (sepc 从 tf offset 256 重读) |
+//! | `restore_and_jump(Trap)` | 既有内核线程恢复 | **仅 S-mode** | 无（直接跳转 sepc） |
 //!
-//! `restore_and_jump(Trap)` 恢复全部 31 GPR 后从 offset 256 重读 sepc
-//! 跳转。GPR 恢复仅覆盖 offset 0~248，sepc 在 offset 256 处始终完好。无需暂存。
+//! 被 IRQ 打断的根协程由 `VschedTaskImpl::restore_context` 直接调用
+//! `restore_and_sret`，使 SPIE 恢复到 SIE；其它既有线程路径保持直接跳转。
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -236,8 +236,8 @@ impl UserTrapFrame {
     ///
     /// - **Yield**: 恢复 callee-saved（ra, sp, s0-s11），`ret` 跳回。
     ///   不碰 CSR，U/S 双模安全。
-    /// - **Trap**: 全量 31 寄存器恢复，用 `sscratch` 暂存 sepc 以避免
-    ///   污染任何 GPR，最后 `jr t0` 跳回。仅 S-mode 安全。
+    /// - **Trap**: 全量恢复寄存器，最后直接跳转到 sepc。根协程的 IRQ
+    ///   continuation 不走此分支，而由任务适配层调用 `restore_and_sret`。
     pub unsafe fn restore_and_jump(&self) -> ! {
         match self.kind {
             UserTrapFrameKind::Yield => {
@@ -269,17 +269,12 @@ impl UserTrapFrame {
                 unimplemented!();
             }
             UserTrapFrameKind::Trap => {
-                // 全量恢复 31 GPR + sp，最后从 trap frame 重读 sepc 跳转。
-                // 不使用 sscratch 暂存 —— sepc 在 offset 256 处从不被覆盖，
-                // 只需在 GPR 恢复后 ld 一次即可。避免 sscratch 污染导致
-                // 嵌套异常时 trap 向量把 sepc 当预保存栈用。
-                // U-mode 执行此处 csr 指令会 illegal instruction，
-                // 将来支持用户态 preemption 时需改用不依赖 CSR 的方案。
+                // 保持 StarryOS 现有普通内核线程恢复行为。被 IRQ 打断的
+                // 根协程在任务适配层已经分流到 restore_and_sret。
                 #[cfg(target_arch = "riscv64")]
                 unsafe {
                     core::arch::asm!(
                         "mv     sp, {tf}",
-                        // 全量恢复 31 GPR
                         "ld     ra, 8(sp)",
                         "ld     gp, 24(sp)",
                         "ld     tp, 32(sp)",
@@ -310,7 +305,6 @@ impl UserTrapFrame {
                         "ld     t4, 232(sp)",
                         "ld     t5, 240(sp)",
                         "ld     t6, 248(sp)",
-                        // sepc 在 offset 256, 上面的 GPR 恢复从未碰它
                         "ld     t0, 256(sp)",
                         "ld     sp, 16(sp)",
                         "jr     t0",

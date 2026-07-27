@@ -1,3 +1,4 @@
+use alloc::{string::String, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use axhal::asm;
@@ -25,6 +26,27 @@ pub static mut VSCHED2_VDSO_START_PA: usize = 0;
 pub static mut VSCHED2_VDSO_SIZE: usize = 0;
 
 static VSCHED2_READY: AtomicBool = AtomicBool::new(false);
+/// `starry_api::init()` may create background kernel threads before the
+/// vsched2 scheduler itself is initialized.  This flag selects the external
+/// scheduler path early without making those threads visible to AxRunQueue.
+static VSCHED2_PREPARED: AtomicBool = AtomicBool::new(false);
+/// Becomes true only after `kernel_init_main` has initialized the kernel
+/// scheduler.  Before this point external-scheduler threads are kept pending.
+static VSCHED2_SCHEDULER_READY: AtomicBool = AtomicBool::new(false);
+/// The initial userspace task passed to `vsched2_bootstrap`.
+///
+/// Unlike the legacy path, `vsched2_bootstrap` never returns to `main`, so the
+/// init task cannot be joined there before powering off.  Keep its scheduler
+/// identity here so only that task's exit terminates the whole system.
+static VSCHED2_INIT_TASK: AtomicUsize = AtomicUsize::new(0);
+
+struct PendingKernelThread {
+    task: axtask::AxTaskRef,
+    priority: isize,
+}
+
+static PENDING_KERNEL_THREADS: spin::Mutex<Vec<PendingKernelThread>> =
+    spin::Mutex::new(Vec::new());
 
 /// 内核 SATP 值，在 activate_vsched_trap_vector 时写入, trap 向量直接加载
 pub static KERNEL_SATP_VAL: AtomicUsize = AtomicUsize::new(0);
@@ -111,6 +133,59 @@ pub fn activate_vsched_trap_vector() {
 
 pub fn push_task_to_kernel(task_ptr: *const ()) -> bool {
     libvsched2::push_task_into_current(task_ptr)
+}
+
+/// Selects vsched2 before `starry_api::init()` creates background tasks.
+///
+/// The scheduler is not usable yet, so tasks created in this interval are
+/// retained by `PENDING_KERNEL_THREADS` and registered during bootstrap.
+pub fn prepare_vsched2() {
+    VSCHED2_PREPARED.store(true, Ordering::Release);
+}
+
+fn register_kernel_thread(task: axtask::AxTaskRef, priority: isize) {
+    let task_ptr = register_task(task, priority, 0, true, None, 0);
+    assert!(
+        push_task_to_kernel(task_ptr as *const ()),
+        "vsched2 kernel ready queue is full"
+    );
+}
+
+fn drain_pending_kernel_threads() {
+    let pending = core::mem::take(&mut *PENDING_KERNEL_THREADS.lock());
+    for PendingKernelThread { task, priority } in pending {
+        register_kernel_thread(task, priority);
+    }
+}
+
+/// Creates a normal kernel thread under the scheduler selected for this boot.
+///
+/// Before vsched2 bootstrap this deliberately uses `axtask::new_raw`, not
+/// `spawn_raw`, so the task cannot become stranded in the legacy AxRunQueue.
+/// The entry closure itself is unchanged and may continue using `block_on`.
+pub fn spawn_kernel_thread<F>(
+    entry: F,
+    name: String,
+    stack_size: usize,
+    priority: isize,
+) -> axtask::AxTaskRef
+where
+    F: FnOnce() + Send + 'static,
+{
+    if !VSCHED2_PREPARED.load(Ordering::Acquire) {
+        return axtask::spawn_raw(entry, name, stack_size);
+    }
+
+    let task = axtask::new_raw(entry, name, stack_size);
+    if VSCHED2_SCHEDULER_READY.load(Ordering::Acquire) {
+        register_kernel_thread(task.clone(), priority);
+    } else {
+        PENDING_KERNEL_THREADS.lock().push(PendingKernelThread {
+            task: task.clone(),
+            priority,
+        });
+    }
+    task
 }
 
 pub fn process_init(vspace: *mut ()) -> usize {
@@ -276,6 +351,23 @@ pub fn set_vsched_task_exited(task: *const ()) {
     use libvsched2::Task;
     vti.wake_generation.fetch_add(1, Ordering::AcqRel);
     vti.set_state(libvsched2::TaskState::Exited);
+
+    // The legacy startup path joins the initial userspace task and then powers
+    // off in `main`.  The vsched2 bootstrap is a non-returning scheduler root,
+    // so perform the equivalent lifecycle transition once the same task has
+    // committed Exited.  Child-process exits must continue through wait4 and
+    // therefore must not reach this branch.
+    if VSCHED2_INIT_TASK
+        .compare_exchange(
+            task as usize,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        axhal::power::system_off();
+    }
 }
 
 pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace: Option<*mut ()>) -> ! {
@@ -311,6 +403,17 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace: Option<*mut (
         libvsched2::VDSO_VTABLE
             .kernel_init_main
             .expect("kernel_init_main not in vtable")(init_stack_ptr, main_ptr as *const ());
+    }
+    VSCHED2_SCHEDULER_READY.store(true, Ordering::Release);
+    drain_pending_kernel_threads();
+
+    if let Some(init_task_ptr) = init_task_ptr {
+        assert!(!init_task_ptr.is_null(), "vsched2 init task is null");
+        assert_eq!(
+            VSCHED2_INIT_TASK.swap(init_task_ptr as usize, Ordering::AcqRel),
+            0,
+            "vsched2 init task was registered twice",
+        );
     }
 
     if let (Some(init_task_ptr), Some(aspace_ptr)) = (init_task_ptr, vspace) {
@@ -390,10 +493,23 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace: Option<*mut (
     }
 
     activate_vsched_trap_vector();
+    curr.set_state(AxTaskState::Blocked);
 
-    loop {
-        unsafe {
-            core::arch::asm!("call vsched_yield_trampoline");
-        }
+    // `raw_kschedule` is the documented initialization entry.  The bootstrap
+    // execution flow remains the per-CPU scheduler wait context and is never
+    // inserted into the normal ready queue.
+    let entry = unsafe {
+        libvsched2::VDSO_VTABLE
+            .raw_kschedule
+            .expect("raw_kschedule not in vtable")
+    };
+    unsafe {
+        core::arch::asm!(
+            "li s1, 0",
+            "li s2, 0",
+            "jalr {entry}",
+            entry = in(reg) entry,
+            options(noreturn),
+        );
     }
 }

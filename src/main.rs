@@ -135,6 +135,11 @@ fn create_vsched_init_task(args: &[String], envs: &[String]) -> (*const starry_c
 
 #[unsafe(no_mangle)]
 fn main() {
+    if USE_VSCHED2 {
+        // `starry_api::init()` creates tty-reader.  Select vsched2 first so
+        // that the task is retained for its scheduler rather than AxRunQueue.
+        starry_core::vsched::prepare_vsched2();
+    }
     starry_api::init();
     vdso::vdso_init();
 

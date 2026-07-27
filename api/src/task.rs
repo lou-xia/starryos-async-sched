@@ -312,10 +312,12 @@ fn vsched_trap_dispatcher(
     trapped_task: Option<*const VschedTaskImpl>,
     tf: &UserTrapFrame,
 ) {
-    // External interrupts are deliberately unrelated to a task.  The timer
-    // comparator is acknowledged in the low-level trap stub; other interrupt
-    // dispatch can be added here without manufacturing a user-task owner.
+    // Interrupt TrapInfo is task-independent, but it still has to pass through
+    // the platform dispatcher so timer, UART and IPI handlers can wake their
+    // waiters.  Keep the complete scause value: axplat uses its high bit to
+    // distinguish CPU-side causes from PLIC IRQ numbers.
     if tf.scause >> 63 == 1 {
+        axhal::irq::irq_handler(tf.scause);
         return;
     }
 

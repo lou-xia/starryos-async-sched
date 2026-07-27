@@ -7,6 +7,7 @@ use core::{
 };
 
 use axtask::{AxTaskRef, TaskExt as _};
+use kernel_guard::{BaseGuard, IrqSave};
 use libvsched2::Stack as _;
 use spin::Mutex;
 
@@ -21,6 +22,46 @@ pub trait CoroutinePoll: Send + Sync {
     fn poll(&self) -> Poll<isize>;
 }
 
+/// 为内核根协程保存其自身的本地中断状态。
+///
+/// vsched2 调度循环始终关中断；真正进入根协程前恢复该协程上次保存的
+/// SIE 状态，正常返回调度器前再保存状态并关中断。这里不能保存一个
+/// `IrqSave` guard 对象，因为 IRQ 或主动让权都可能让当前 poll 非局部地
+/// 离开，因而不能依赖 `Drop` 执行。
+pub struct IrqCorotineWrapper {
+    inner: Arc<dyn CoroutinePoll>,
+    irq_state: AtomicUsize,
+}
+
+impl IrqCorotineWrapper {
+    const SIE: usize = 1 << 1;
+
+    fn new(inner: Arc<dyn CoroutinePoll>) -> Self {
+        Self {
+            inner,
+            // 新创建的内核任务默认可被中断；后续每次 poll 都恢复它
+            // 上一次离开时实际保存的状态。
+            irq_state: AtomicUsize::new(Self::SIE),
+        }
+    }
+}
+
+impl CoroutinePoll for IrqCorotineWrapper {
+    fn poll(&self) -> Poll<isize> {
+        assert!(
+            !axhal::asm::irqs_enabled(),
+            "IrqCorotineWrapper must be entered with IRQs disabled"
+        );
+
+        let saved = self.irq_state.load(Ordering::Acquire);
+        IrqSave::release(saved);
+        let result = self.inner.poll();
+        let saved = IrqSave::acquire();
+        self.irq_state.store(saved, Ordering::Release);
+        result
+    }
+}
+
 /// 封装 AxTaskRef 以适配 vsched2 Task trait。
 pub struct VschedTaskImpl {
     pub task: AxTaskRef,
@@ -33,6 +74,9 @@ pub struct VschedTaskImpl {
     pub pid: AtomicUsize,
     pub wake_generation: AtomicUsize,
     pub is_coroutine: AtomicBool,
+    /// IRQ 将根协程临时提升为线程后，在线程栈已经重新安装、即将恢复
+    /// Trap 上下文时据此恢复协程身份。
+    resume_to_coroutine: AtomicBool,
     pub return_value: AtomicIsize,
     pub thread_stack_base: AtomicUsize,
     /// 线程栈的 Stack 实现对象指针（`*mut VschedStackImpl`），由 `thread_stack()` 返回
@@ -66,6 +110,7 @@ impl VschedTaskImpl {
             pid: AtomicUsize::new(pid),
             wake_generation: AtomicUsize::new(1),
             is_coroutine: AtomicBool::new(coroutine.is_some()),
+            resume_to_coroutine: AtomicBool::new(false),
             return_value: AtomicIsize::new(0),
             thread_stack_base: AtomicUsize::new(0),
             thread_stack_ptr: AtomicUsize::new(0),
@@ -137,6 +182,56 @@ impl VschedTaskImpl {
     pub fn has_execution_task(&self) -> bool {
         self.execution_task.lock().is_some()
     }
+
+    /// 将被 IRQ 打断的内核根协程临时提升为线程。
+    ///
+    /// 此函数在本地中断关闭、进入 vsched2 `trap_entry` 之前调用。
+    /// `take_current_stack()` 取出的正是被打断协程正在使用的栈；把这个
+    /// 概念上的 `_old` 保存为任务线程栈后，vsched2 随后的
+    /// `set_current_stack()` 会有意得到 `None`，避免把同一栈再次当成可回收
+    /// 的旧栈。中断处理仍使用 `sscratch` 中的 trap 栈。
+    pub fn promote_interrupted_kernel_coroutine(&self) -> bool {
+        if !self.is_kernel.load(Ordering::Acquire)
+            || !self.is_coroutine.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        assert!(
+            !self.resume_to_coroutine.load(Ordering::Acquire),
+            "interrupted coroutine already awaits restoration"
+        );
+
+        let stack = libvsched2::take_current_stack();
+        assert!(
+            !stack.is_null(),
+            "interrupted coroutine has no current stack"
+        );
+        self.thread_stack_ptr.store(stack as usize, Ordering::Release);
+        self.resume_to_coroutine.store(true, Ordering::Release);
+        self.is_coroutine.store(false, Ordering::Release);
+        true
+    }
+
+    /// 在主动让权进入 vsched2 前，把当前 CPU 上安装的线程栈交还给任务。
+    ///
+    /// `raw_thread_entry` 之后调度器可能在本核等待，也可能让该任务在其它
+    /// 核恢复，因此不能继续把保存了 continuation 的栈作为调度器栈使用。
+    /// 普通线程已有稳定的 `thread_stack_ptr`；由 `block_on` 临时提升的
+    /// 协程则在这里首次取得并登记它刚刚使用的协程栈。
+    pub fn detach_thread_stack_for_resched(&self) {
+        assert!(
+            !self.is_coroutine.load(Ordering::Acquire),
+            "cannot detach stack from a coroutine context"
+        );
+
+        let stack = libvsched2::take_current_stack();
+        assert!(!stack.is_null(), "thread has no current stack to detach");
+        let previous = self.thread_stack_ptr.swap(stack as usize, Ordering::AcqRel);
+        assert!(
+            previous == 0 || previous == stack as usize,
+            "thread current stack differs from its saved stack"
+        );
+    }
 }
 
 impl libvsched2::Task for VschedTaskImpl {
@@ -204,6 +299,21 @@ impl libvsched2::Task for VschedTaskImpl {
         let tf_ptr = self.trap_frame.load(Ordering::Acquire);
         assert_ne!(tf_ptr, 0, "restore_context: trap_frame is null");
         let tf = unsafe { &*(tf_ptr as *const UserTrapFrame) };
+
+        // run_task 已经通过 thread_stack() 把被 IRQ 打断的栈安装为当前
+        // current_stack，此后任务可恢复为协程。即使 sret 后立刻再次发生
+        // IRQ，新的中断也会再次按同一协议取走这个 current_stack。
+        if self.resume_to_coroutine.swap(false, Ordering::AcqRel) {
+            assert!(
+                !self.is_coroutine.load(Ordering::Acquire),
+                "interrupted coroutine was restored twice"
+            );
+            self.thread_stack_ptr.store(0, Ordering::Release);
+            self.is_coroutine.store(true, Ordering::Release);
+            // 只有真正被 IRQ 打断的根协程需要应用保存的 sstatus，执行
+            // SPIE -> SIE。普通内核线程继续使用既有的直接跳转恢复路径。
+            unsafe { tf.restore_and_sret() };
+        }
         unsafe { tf.restore_and_jump() };
     }
 
@@ -267,8 +377,10 @@ fn initial_kernel_thread_frame(task: &AxTaskRef) -> Option<Box<UserTrapFrame>> {
     Some(Box::new(UserTrapFrame {
         regs,
         sepc: kernel_thread_entry as *const () as usize,
-        // restore_and_jump does not consume sstatus, but keep an S-mode frame
-        // for diagnostics and for any future unified restore implementation.
+        // sret returns to S-mode (SPP).  Preserve the existing migration-stage
+        // rule that ordinary kernel threads start with IRQs disabled; only
+        // root coroutines opt into interruptible execution through
+        // IrqCorotineWrapper.
         sstatus: 1 << 8,
         scause: 0,
         stval: 0,
@@ -294,6 +406,13 @@ pub fn register_task(
     coroutine: Option<Arc<dyn CoroutinePoll>>,
     vdso_base: usize,
 ) -> *const VschedTaskImpl {
+    let coroutine = coroutine.map(|coroutine| {
+        if is_kernel {
+            Arc::new(IrqCorotineWrapper::new(coroutine)) as Arc<dyn CoroutinePoll>
+        } else {
+            coroutine
+        }
+    });
     let is_thread = coroutine.is_none();
     let initial_frame = if is_kernel && is_thread {
         initial_kernel_thread_frame(&task)

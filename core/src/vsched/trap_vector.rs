@@ -153,14 +153,37 @@ extern "C" fn vsched2_trap_entry_stub(
     tf_stack: *const UserTrapFrame, task_ptr: *const (),
 ) -> ! {
     let tf = unsafe { &*tf_stack };
-    if tf.scause == 0x8000000000000005 {
-        unsafe { core::arch::asm!("li {t}, -1", "csrw stimecmp, {t}", t = out(reg) _); }
+    match tf.scause {
+        // STIP is cleared by moving the comparator beyond any real deadline.
+        // The registered timer handler installs the next deadline later.
+        0x8000000000000005 => unsafe {
+            core::arch::asm!("li {t}, -1", "csrw stimecmp, {t}", t = out(reg) _);
+        },
+        // PLIC claim/complete is intentionally deferred to TrapHandler.  Mask
+        // only this hart's external-interrupt enable so the level-triggered
+        // source cannot re-enter before that delayed processing completes.
+        0x8000000000000009 => unsafe {
+            core::arch::asm!("csrc sie, {seie}", seie = in(reg) 1usize << 9);
+        },
+        // Clear the local IPI pending bit before scheduling its TrapHandler.
+        // The platform IRQ path clears it as well; doing it here prevents an
+        // immediate re-entry when the scheduler temporarily enables IRQs.
+        0x8000000000000001 => unsafe {
+            core::arch::asm!("csrc sip, {ssip}", ssip = in(reg) 1usize << 1);
+        },
+        _ => {}
     }
 
     let mut task_ptr = task_ptr;
     if task_ptr.is_null() { task_ptr = libvsched2::current_task_ptr(); }
     if !task_ptr.is_null() {
         let vti = unsafe { &*(task_ptr as *const VschedTaskImpl) };
+        if trap_type == 1 {
+            // 根协程被 IRQ 打断后必须先保留它正在使用的 current_stack。
+            // vsched2 随后仍按原有 IRQ 栈协议使用 sscratch 中的 trap 栈；
+            // 该任务则以线程形式恢复被打断的 poll continuation。
+            vti.promote_interrupted_kernel_coroutine();
+        }
         // A reusable handler may trap while executing in a user task's
         // axtask/ActiveScope context. Release that per-CPU context before the
         // scheduler runs another handler; restore_context installs it again.
@@ -232,6 +255,17 @@ extern "C" fn vsched_yield_entry_stub(tf_stack: *const UserTrapFrame) -> ! {
             TaskState::Exited,
             TaskState::Blocking,
         );
+
+        // vsched2 的线程上下文包含寄存器和栈两部分。寄存器已经保存到
+        // stable trap frame；线程栈也必须在进入 raw_thread_entry 前从
+        // per-CPU current_stack 中取出并归还任务。协程的普通 resched 会
+        // 丢弃本轮 poll continuation，因此仍保留 current_stack 供复用。
+        if !vti
+            .is_coroutine
+            .load(core::sync::atomic::Ordering::Acquire)
+        {
+            vti.detach_thread_stack_for_resched();
+        }
     }
 
     let entry = unsafe {

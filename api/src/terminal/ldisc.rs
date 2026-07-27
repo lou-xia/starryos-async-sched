@@ -255,7 +255,7 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
             ProcessMode::Manual => Processor::Manual(reader),
             ProcessMode::External(register) => {
                 let poll_rx = Arc::new(PollSet::new());
-                axtask::spawn_with_name(
+                starry_core::vsched::spawn_kernel_thread(
                     {
                         let poll_rx = poll_rx.clone();
                         let poll_tx = poll_tx.clone();
@@ -274,6 +274,8 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
                         }
                     },
                     "tty-reader".into(),
+                    axconfig::TASK_STACK_SIZE,
+                    starry_core::vsched::HIGHEST_PRIORITY + 1,
                 );
                 Processor::External(poll_rx)
             }
