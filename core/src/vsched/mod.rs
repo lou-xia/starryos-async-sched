@@ -109,8 +109,8 @@ pub fn activate_vsched_trap_vector() {
     }
 }
 
-pub fn push_task_to_kernel(task_ptr: *const ()) {
-    libvsched2::push_task_into_current(task_ptr);
+pub fn push_task_to_kernel(task_ptr: *const ()) -> bool {
+    libvsched2::push_task_into_current(task_ptr)
 }
 
 pub fn process_init(vspace: *mut ()) -> usize {
@@ -137,6 +137,62 @@ pub fn current_task_ptr() -> *const () {
     libvsched2::current_task_ptr()
 }
 
+/// Captures the task that currently owns a `block_on` continuation.
+///
+/// axtask cannot depend on libvsched2 directly, so this is registered as a
+/// callback during bootstrap and stored in each AxWaker together with the
+/// current generation.
+pub fn current_block_on_task() -> (*const (), usize) {
+    let task = current_task_ptr();
+    if task.is_null() {
+        return (core::ptr::null(), 0);
+    }
+    let task_impl = unsafe { &*(task as *const task::VschedTaskImpl) };
+    (
+        task,
+        task_impl.wake_generation.load(Ordering::Acquire),
+    )
+}
+
+/// Starts or cancels the task-state part of a block_on operation.
+///
+/// The AxWaker first enters Parking, then this function atomically commits
+/// Running -> Blocking, and only afterwards publishes Parked.  Consequently a
+/// Waker on another CPU either leaves a notification before this commit or sees
+/// a task that is already safe to change from Blocking/Blocked to Ready.
+pub fn transition_block_on_task(blocking: bool) -> bool {
+    let task = current_task_ptr();
+    if task.is_null() {
+        return false;
+    }
+    let task_impl = unsafe { &*(task as *const task::VschedTaskImpl) };
+    use libvsched2::{Task as _, TaskState};
+    let previous = if blocking {
+        task_impl.match_set_state(
+            TaskState::Ready,
+            TaskState::Blocking,
+            TaskState::Blocked,
+            TaskState::Exited,
+            TaskState::Blocking,
+        )
+    } else {
+        task_impl.match_set_state(
+            TaskState::Ready,
+            TaskState::Running,
+            TaskState::Blocked,
+            TaskState::Exited,
+            TaskState::Running,
+        )
+    };
+    match (blocking, previous) {
+        (true, TaskState::Running) | (false, TaskState::Blocking) => true,
+        (_, TaskState::Exited) => false,
+        (_, state) => panic!(
+            "block_on: invalid task state transition, blocking={blocking}, previous={state:?}"
+        ),
+    }
+}
+
 pub fn wake_blocked_task(task: *const (), generation: usize) -> bool {
     if task.is_null() {
         return false;
@@ -155,25 +211,22 @@ pub fn wake_blocked_task(task: *const (), generation: usize) -> bool {
     );
     match previous {
         TaskState::Blocked => {
-            if libvsched2::push_task(task) {
-                true
-            } else {
-                task_impl.match_set_state(
-                    TaskState::Blocked,
-                    TaskState::Running,
-                    TaskState::Blocked,
-                    TaskState::Exited,
-                    TaskState::Blocking,
-                );
-                false
-            }
+            // This transition is the unique owner of queue insertion.  A
+            // second Waker observes Ready and does nothing.  Rolling Ready
+            // back to Blocked on failure would lose a concurrent notification,
+            // so queue exhaustion is an explicit fatal invariant violation.
+            assert!(
+                libvsched2::push_task(task),
+                "wake_blocked_task: ready queue is full"
+            );
+            true
         }
         // A wake racing with context save changes Blocking to Ready.  The
         // vsched2 thread-entry path observes Ready and performs the enqueue
         // after the context is safe to resume.
         TaskState::Blocking => true,
-        TaskState::Exited => false,
-        _ => true,
+        TaskState::Ready => true,
+        TaskState::Running | TaskState::Exited => false,
     }
 }
 
@@ -189,6 +242,13 @@ pub fn set_trapped_vsched_task(task: *const ()) {
 
 /// 读取当前被 trap_handler 服务的用户任务（不被 CURRENT_TASK 影响）。
 pub fn trapped_vsched_task() -> *const () {
+    let current = current_task_ptr() as *const task::VschedTaskImpl;
+    if !current.is_null() {
+        let owner = unsafe { &*current }.trap_owner.load(Ordering::Acquire);
+        if owner != 0 {
+            return owner as *const ();
+        }
+    }
     TRAPPED_VSCHED_TASK[<smp::VschedSmpImpl as libvsched2::SMP>::cpu_id()]
         .load(Ordering::Acquire) as *const ()
 }
@@ -229,6 +289,11 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace: Option<*mut (
     }
     axtask::register_vsched2_yield(vsched_yield_trampoline);
     axtask::register_block_on_toggle(trap::toggle_handler);
+    axtask::register_block_on_hooks(
+        current_block_on_task,
+        wake_blocked_task,
+        transition_block_on_task,
+    );
 
     // Initialize empty AxRunQueue so legacy code paths (AxWaker, timer
     // tick, etc.) that deref it under vsched2 don't LazyInit-panic.

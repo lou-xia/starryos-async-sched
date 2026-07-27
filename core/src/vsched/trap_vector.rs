@@ -161,6 +161,12 @@ extern "C" fn vsched2_trap_entry_stub(
     if task_ptr.is_null() { task_ptr = libvsched2::current_task_ptr(); }
     if !task_ptr.is_null() {
         let vti = unsafe { &*(task_ptr as *const VschedTaskImpl) };
+        // A reusable handler may trap while executing in a user task's
+        // axtask/ActiveScope context. Release that per-CPU context before the
+        // scheduler runs another handler; restore_context installs it again.
+        if vti.has_execution_task() {
+            vti.leave_execution_context();
+        }
         // Pending TrapInfo会长期持有该任务的trap frame。全局循环缓冲会被其它
         // 任务的后续trap覆盖，因此必须保存到每个任务独占且地址稳定的frame中。
         save_task_trap_frame(vti, tf_stack);
@@ -208,6 +214,10 @@ extern "C" fn vsched_yield_entry_stub(tf_stack: *const UserTrapFrame) -> ! {
     let current_task = libvsched2::current_task_ptr();
     if !current_task.is_null() {
         let vti = unsafe { &*(current_task as *const VschedTaskImpl) };
+        // A Thread extension owns the active scope read guard.  Release it
+        // before the external scheduler switches away; restore_context or
+        // the next coroutine poll acquires it again for the resumed task.
+        vti.leave_execution_context();
         // handler会频繁yield；复用任务自己的稳定frame，避免每次yield泄漏一个Box。
         save_task_trap_frame(vti, tf_stack);
 

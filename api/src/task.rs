@@ -1,14 +1,14 @@
+use alloc::sync::Arc;
 use core::{
     ffi::c_long,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::Ordering,
 };
 
 use axerrno::{AxError, AxResult};
 use axhal::uspace::{ExceptionKind, ReturnReason, UserContext};
-use axtask::{AxTaskRef, TaskInner, current, spawn_task, vsched2_active};
+use axtask::{AxTaskRef, TaskInner, current, vsched2_active};
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::general::ROBUST_LIST_LIMIT;
-use ringbuf::Arc;
 use starry_core::{
     futex::FutexKey,
     shm::SHM_MANAGER,
@@ -302,23 +302,6 @@ pub fn raise_signal_fatal(sig: SignalInfo) -> AxResult<()> {
     raise_signal_fatal_for_task(&current(), sig)
 }
 
-fn syscall_task(mut uctx: UserContext, finish: Arc<AtomicBool>) {
-    let entry = move || {
-        assert!(
-            !finish.load(Ordering::SeqCst),
-            "Syscall task should only run once"
-        );
-        handle_syscall(&mut uctx);
-        finish.store(true, Ordering::SeqCst);
-    };
-    let task = TaskInner::new(
-        entry,
-        "syscall".into(),
-        starry_core::config::KERNEL_STACK_SIZE,
-    );
-    spawn_task(task);
-}
-
 use starry_core::vsched::trapframe::UserTrapFrame;
 use starry_core::vsched::task::VschedTaskImpl;
 
@@ -375,44 +358,21 @@ fn vsched_trap_dispatcher(
             uctx.set_sysno(tf.regs.a7);
             uctx.set_ra(tf.regs.ra);
             uctx.set_tls(tf.regs.tp);
+            let outcome = handle_syscall(&mut uctx);
+            assert_eq!(
+                outcome,
+                SyscallOutcome::Complete,
+                "TrapHandler returned from a syscall before its block_on completed"
+            );
 
-            // Set the active scope to the user task's scope so
-            // scope-local variables (FD_TABLE etc.) resolve correctly.
-            let scope_guard = vti.task.try_as_thread().map(|thr| {
-                let guard = thr.proc_data.scope.read();
-                // SAFETY: guard holds the lock; scope lives until guard drops.
-                unsafe { scope_local::ActiveScope::set(&*guard) };
-                guard
-            });
-            // 记录被服务的用户任务，供 mark_exited 使用。
-            // 不覆盖 vsched2 CURRENT_TASK（仍是 trap_handler），
-            // 确保 yield 时从 handler 身份走 run_task 路径。
-            starry_core::vsched::set_trapped_vsched_task(trapped_task as *const ());
-
-            let syscall_outcome = axtask::with_current_task(&vti.task, || {
-                handle_syscall(&mut uctx)
-            });
-
-            starry_core::vsched::clear_trapped_vsched_task(trapped_task as *const ());
-
-            drop(scope_guard);
-            scope_local::ActiveScope::set_global();
-
-            if syscall_outcome == SyscallOutcome::Pending {
-                return;
+            if vti.task.state() != axtask::TaskState::Exited {
+                let tf_mut = unsafe { &mut *(tf_ptr as *mut UserTrapFrame) };
+                tf_mut.regs.a0 = uctx.arg0();
+                tf_mut.regs.a1 = uctx.arg1();
+                tf_mut.regs.sp = uctx.regs.sp;
+                tf_mut.sepc = uctx.ip();
+                tf_mut.sstatus = uctx.sstatus.bits();
             }
-
-            let tf_mut = unsafe { &mut *(tf_ptr as *mut UserTrapFrame) };
-            let new_ip = uctx.ip();
-            let new_sp = uctx.regs.sp;
-// axlog::ax_println!(
-
-            tf_mut.regs.a0 = uctx.arg0();  // return value
-            tf_mut.regs.a1 = uctx.arg1();
-            tf_mut.regs.sp = new_sp;
-            tf_mut.sepc = new_ip;
-// axlog::ax_println!("[write] fd={} len={} ret={}", tf.regs.a0, tf.regs.a2, tf_mut.regs.a0);
-            tf_mut.sstatus = uctx.sstatus.bits();
         }
 // if log_detail { axlog::ax_println!("[pf] ENTER vaddr={:#x} scause={}", tf.stval, tf.scause); }
           12 | 13 | 15 => {

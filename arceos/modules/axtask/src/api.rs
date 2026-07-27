@@ -11,9 +11,22 @@ use kernel_guard::NoPreemptIrqSave;
 /// Function pointer for vsched2 yield trampoline.
 /// When set (non-zero), `yield_now()` delegates to vsched2 instead of AxRunQueue.
 static VSCHED2_YIELD: AtomicUsize = AtomicUsize::new(0);
-/// Toggle function for block_on: toggles handler coroutine ↔ thread mode.
-/// First call before yield (→ thread), second call after yield resume (→ coroutine).
+/// Context-conversion callback for the vsched2-aware `block_on` path.
+/// `true` promotes the current coroutine to a thread before yield; `false`
+/// restores a task promoted by the matching block_on invocation.
 pub(crate) static BLOCK_ON_TOGGLE: AtomicUsize = AtomicUsize::new(0);
+
+/// Atomically starts or cancels the task-state part of a block operation.
+/// `true` commits Running -> Blocking; `false` cancels Blocking -> Running.
+pub(crate) static BLOCK_ON_STATE: AtomicUsize = AtomicUsize::new(0);
+
+/// Returns the externally scheduled task currently executing `block_on` and
+/// its wait-generation.  The callback is installed by StarryOS' vsched2
+/// adapter, so axtask does not need to depend on libvsched2.
+pub(crate) static BLOCK_ON_CURRENT: AtomicUsize = AtomicUsize::new(0);
+
+/// Wakes an externally scheduled task captured by `BLOCK_ON_CURRENT`.
+pub(crate) static BLOCK_ON_WAKE: AtomicUsize = AtomicUsize::new(0);
 
 /// Register the vsched2 yield trampoline. After this, all `yield_now()` calls
 /// will enter the vsched2 scheduler instead of the legacy AxRunQueue.
@@ -21,9 +34,54 @@ pub fn register_vsched2_yield(yield_fn: unsafe extern "C" fn() -> !) {
     VSCHED2_YIELD.store(yield_fn as usize, core::sync::atomic::Ordering::Release);
 }
 
-/// Register the block_on toggle function. Called from block_on before/after yield.
-pub fn register_block_on_toggle(toggle: fn()) {
+/// Register the block_on context-conversion function.
+pub fn register_block_on_toggle(toggle: fn(bool) -> bool) {
     BLOCK_ON_TOGGLE.store(toggle as usize, core::sync::atomic::Ordering::Release);
+}
+
+/// Registers the callbacks used by the vsched2-aware `block_on` backend.
+///
+/// The callbacks are deliberately function pointers instead of a dependency
+/// on libvsched2: axtask is also used with the legacy AxRunQueue scheduler.
+pub fn register_block_on_hooks(
+    current: fn() -> (*const (), usize),
+    wake: fn(*const (), usize) -> bool,
+    state: fn(bool) -> bool,
+) {
+    BLOCK_ON_CURRENT.store(current as usize, core::sync::atomic::Ordering::Release);
+    BLOCK_ON_WAKE.store(wake as usize, core::sync::atomic::Ordering::Release);
+    BLOCK_ON_STATE.store(state as usize, core::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn block_on_current_task() -> Option<(*const (), usize)> {
+    let ptr = BLOCK_ON_CURRENT.load(core::sync::atomic::Ordering::Acquire);
+    if ptr == 0 {
+        return None;
+    }
+    let current: fn() -> (*const (), usize) = unsafe { core::mem::transmute(ptr) };
+    let (task, generation) = current();
+    (!task.is_null()).then_some((task, generation))
+}
+
+pub(crate) fn wake_block_on_task(task: *const (), generation: usize) -> bool {
+    let ptr = BLOCK_ON_WAKE.load(core::sync::atomic::Ordering::Acquire);
+    if ptr == 0 || task.is_null() {
+        return false;
+    }
+    let wake: fn(*const (), usize) -> bool = unsafe { core::mem::transmute(ptr) };
+    wake(task, generation)
+}
+
+/// Commits (`blocking = true`) or cancels (`blocking = false`) the current
+/// task's Blocking state.  The waiter's own atomic handshake decides when it
+/// is safe for a remote CPU to call the wake callback.
+pub(crate) fn transition_block_on_task(blocking: bool) -> Option<bool> {
+    let ptr = BLOCK_ON_STATE.load(core::sync::atomic::Ordering::Acquire);
+    if ptr == 0 {
+        return None;
+    }
+    let state: fn(bool) -> bool = unsafe { core::mem::transmute(ptr) };
+    Some(state(blocking))
 }
 
 /// Returns true if vsched2 yield is registered (non-zero).

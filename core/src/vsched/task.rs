@@ -6,8 +6,9 @@ use core::{
     task::Poll,
 };
 
-use axtask::AxTaskRef;
+use axtask::{AxTaskRef, TaskExt as _};
 use libvsched2::Stack as _;
+use spin::Mutex;
 
 use super::{
     from_vsched_state, to_vsched_state,
@@ -23,6 +24,9 @@ pub trait CoroutinePoll: Send + Sync {
 /// 封装 AxTaskRef 以适配 vsched2 Task trait。
 pub struct VschedTaskImpl {
     pub task: AxTaskRef,
+    /// axtask identity visible while this task executes.  A reusable trap
+    /// handler changes this owner for every TrapInfo it accepts.
+    execution_task: Mutex<Option<AxTaskRef>>,
     pub priority: AtomicIsize,
     /// 任务运行特权级。它与 `pid`（所属地址空间）相互独立。
     pub is_kernel: AtomicBool,
@@ -42,6 +46,8 @@ pub struct VschedTaskImpl {
     pub user_page_table_root: AtomicUsize,
     /// 用户 AddrSpace 裸指针(Arc<Mutex<AddrSpace>>), 用于 copy_mappings_from
     pub user_aspace_ptr: AtomicUsize,
+    /// User vsched2 task whose trap is being serviced by this task.
+    pub trap_owner: AtomicUsize,
 }
 
 impl VschedTaskImpl {
@@ -54,6 +60,7 @@ impl VschedTaskImpl {
     ) -> Self {
         Self {
             task,
+            execution_task: Mutex::new(None),
             priority: AtomicIsize::new(priority),
             is_kernel: AtomicBool::new(is_kernel),
             pid: AtomicUsize::new(pid),
@@ -67,11 +74,68 @@ impl VschedTaskImpl {
             user_page_table_root: AtomicUsize::new(0),
             user_aspace_ptr: AtomicUsize::new(0),
             user_vdso_base: AtomicUsize::new(0),
+            trap_owner: AtomicUsize::new(0),
         }
     }
 
     pub fn inner(&self) -> &AxTaskRef {
         &self.task
+    }
+
+    fn execution_task(&self) -> AxTaskRef {
+        self.execution_task
+            .lock()
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| self.task.clone())
+    }
+
+    fn enter_execution_context(&self, install_current: bool) {
+        let task = self.execution_task();
+        if install_current {
+            axtask::install_current_task_for_external_scheduler(&task);
+        }
+        if let Some(ext) = task.task_ext() {
+            ext.on_enter();
+        }
+    }
+
+    pub fn leave_execution_context(&self) {
+        let task = self.execution_task();
+        if let Some(ext) = task.task_ext() {
+            ext.on_leave();
+        }
+    }
+
+    /// Binds a reusable kernel handler to the user task whose TrapInfo it is
+    /// processing.  The binding remains installed while block_on saves and
+    /// restores the handler continuation.
+    pub fn bind_execution_task(&self, owner: *const VschedTaskImpl) {
+        assert!(!owner.is_null(), "bind_execution_task: null owner");
+        let owner = unsafe { &*owner };
+        let mut slot = self.execution_task.lock();
+        assert!(slot.is_none(), "trap handler already has an execution owner");
+        *slot = Some(owner.task.clone());
+        drop(slot);
+        self.trap_owner
+            .store(owner as *const _ as usize, Ordering::Release);
+        self.enter_execution_context(true);
+    }
+
+    /// Clears the current TrapInfo owner.  Advancing the generation makes any
+    /// Waker retained by the completed syscall unable to wake this handler
+    /// after it has been reused for a later TrapInfo.
+    pub fn unbind_execution_task(&self) {
+        self.leave_execution_context();
+        self.wake_generation.fetch_add(1, Ordering::AcqRel);
+        self.trap_owner.store(0, Ordering::Release);
+        let old = self.execution_task.lock().take();
+        assert!(old.is_some(), "trap handler has no execution owner");
+        axtask::install_current_task_for_external_scheduler(&self.task);
+    }
+
+    pub fn has_execution_task(&self) -> bool {
+        self.execution_task.lock().is_some()
     }
 }
 
@@ -133,13 +197,10 @@ impl libvsched2::Task for VschedTaskImpl {
     /// 从 `trap_frame` 恢复寄存器上下文。不返回——直接跳转到保存的指令。
     /// 仅内核任务调用（用户任务走 `into_user_context`）。
     fn restore_context(&self) {
-        // A normal axtask kernel thread expects axtask::current() to follow
-        // every context restore.  TrapHandler is excluded because its
-        // temporary thread continuation deliberately runs inside the user
-        // task's with_current_task scope.
-        if self.is_kernel.load(Ordering::Acquire) && self.coroutine.is_none() {
-            axtask::install_current_task_for_external_scheduler(&self.task);
-        }
+        // Reusable trap handlers restore the dynamic user execution identity;
+        // ordinary kernel tasks restore their own axtask identity.
+        let install_current = self.is_kernel.load(Ordering::Acquire);
+        self.enter_execution_context(install_current);
         let tf_ptr = self.trap_frame.load(Ordering::Acquire);
         assert_ne!(tf_ptr, 0, "restore_context: trap_frame is null");
         let tf = unsafe { &*(tf_ptr as *const UserTrapFrame) };
@@ -147,9 +208,12 @@ impl libvsched2::Task for VschedTaskImpl {
     }
 
     fn poll(&self) -> Poll<isize> {
+        let install_current = self.is_kernel.load(Ordering::Acquire);
         match self.coroutine.as_ref() {
             Some(coro) => {
+                self.enter_execution_context(install_current);
                 let polled = coro.poll();
+                self.leave_execution_context();
                 if let Poll::Ready(value) = polled {
                     self.return_value.store(value, Ordering::Release);
                 }

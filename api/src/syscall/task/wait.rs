@@ -172,7 +172,10 @@ pub fn sys_waitpid_step(pid: i32, exit_code: *mut i32, options: u32) -> WaitPidS
     };
 // axlog::ax_println!("[wait] blocking...");
     let trapped_task = starry_core::vsched::trapped_vsched_task();
-    if axtask::vsched2_active() && !trapped_task.is_null() {
+    if axtask::vsched2_active()
+        && !trapped_task.is_null()
+        && starry_core::vsched::current_task_ptr() == trapped_task
+    {
         let task = unsafe {
             &*(trapped_task as *const starry_core::vsched::task::VschedTaskImpl)
         };

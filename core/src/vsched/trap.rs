@@ -28,6 +28,13 @@ pub fn set_last_trapped_user_task(task: *const ()) {
 }
 
 pub fn get_last_trapped_user_task() -> *const VschedTaskImpl {
+    let current = libvsched2::current_task_ptr() as *const VschedTaskImpl;
+    if !current.is_null() {
+        let owner = unsafe { &*current }.trap_owner.load(Ordering::Acquire);
+        if owner != 0 {
+            return owner as *const VschedTaskImpl;
+        }
+    }
     LAST_TRAPPED_USER_TASK[<super::smp::VschedSmpImpl as SMP>::cpu_id()]
         .load(Ordering::Acquire) as *const VschedTaskImpl
 }
@@ -47,6 +54,22 @@ static TRAP_DISPATCHER: AtomicUsize = AtomicUsize::new(0);
 
 pub fn register_trap_dispatcher(dispatcher: TrapDispatcher) {
     TRAP_DISPATCHER.store(dispatcher as usize, Ordering::Release);
+}
+
+fn effective_user_owner(mut task: *const VschedTaskImpl) -> Option<*const VschedTaskImpl> {
+    // Nested kernel traps form a short owner chain (handler -> user task).
+    // Bound the walk so corrupted owner metadata cannot loop forever.
+    for _ in 0..8 {
+        if task.is_null() {
+            return None;
+        }
+        let vti = unsafe { &*task };
+        if !vti.is_kernel() {
+            return Some(task);
+        }
+        task = vti.trap_owner.load(Ordering::Acquire) as *const VschedTaskImpl;
+    }
+    panic!("trap owner chain is cyclic or too deep");
 }
 
 // ---- TrapInfo implementation ----
@@ -73,19 +96,16 @@ impl libvsched2::TrapInfo for VschedTrapInfoImpl {
         }
         // `task` is authoritative: vsched2 passes None for external interrupts.
         let trapped = task.map(|ptr| ptr as *const VschedTaskImpl);
-        // Keep the originating user task available only while its dispatcher is
-        // active, so a nested handler fault can resolve the correct AddrSpace.
-        let cached_user = trapped.filter(|ptr| {
-            let vti = unsafe { &**ptr };
-            !vti.is_kernel()
-        });
-        if let Some(user) = cached_user {
-            set_last_trapped_user_task(user as *const ());
+        let owner = trapped.and_then(effective_user_owner);
+        let handler = libvsched2::current_task_ptr() as *const VschedTaskImpl;
+        if let Some(owner) = owner {
+            assert!(!handler.is_null(), "TrapInfo::handle: no current handler");
+            unsafe { &*handler }.bind_execution_task(owner);
         }
         let dispatcher: TrapDispatcher = unsafe { core::mem::transmute(dispatcher) };
         dispatcher(trapped, &self.frame);
-        if let Some(user) = cached_user {
-            clear_last_trapped_user_task(user);
+        if owner.is_some() {
+            unsafe { &*handler }.unbind_execution_task();
         }
     }
 
@@ -116,10 +136,6 @@ impl libvsched2::TrapInfo for VschedTrapInfoImpl {
         });
 // axlog::ax_println!("[new_handler] DONE ptr={:#x}", ptr as usize);
         let ptr = register_task(task_ref, HIGHEST_PRIORITY, 0, true, Some(coro), 0);
-        // 为 handler 预分配一个栈，供 toggle 到线程模式时使用
-        let handler_stack = super::alloc_stack();
-        set_handler_stack(handler_stack as usize);
-        axlog::ax_println!("[new_handler] stack={:#x}", handler_stack as usize);
         ptr as *const ()
     }
 }
@@ -144,37 +160,43 @@ impl CoroutinePoll for TrapHandlerCoroutine {
     }
 }
 
-/// 记录 handler 的协程栈 VSI 指针，供 toggle 时设置 thread_stack_ptr 使用。
-static HANDLER_STACK: [AtomicUsize; CPU_NUM] = [const { AtomicUsize::new(0) }; CPU_NUM];
-
-pub fn set_handler_stack(stack: usize) {
-    HANDLER_STACK[<super::smp::VschedSmpImpl as SMP>::cpu_id()].store(stack, Ordering::Release);
-}
-
-/// 交替切换 handler 的 is_coroutine 状态。
-/// 第一次调用: coroutine → thread（yield 前）
-/// 第二次调用: thread → coroutine（yield 恢复后）
-pub fn toggle_handler() {
+/// 交替切换当前 vsched2 任务的 is_coroutine 状态。
+///
+/// 第一次调用发生在 `block_on` 已经原子提交 Blocking 且发布 Parked 之后：取走当前 CPU 正在使用的真实协程栈，并交给该任务作为线程栈。这里不能使用一个 per-CPU 的 handler 栈槽，因为 block_on 可以由多个独立任务调用。
+///
+/// 第二次调用发生在原线程栈恢复后：任务恢复协程态，使下一次调度按根 Future poll 路径处理。
+pub fn toggle_handler(promote: bool) -> bool {
     let ptr = libvsched2::current_task_ptr() as *const super::VschedTaskImpl;
-    if ptr.is_null() { return; }
+    if ptr.is_null() {
+        return false;
+    }
     let vti = unsafe { &*ptr };
-    if vti.pid.load(Ordering::Acquire) != 0 { return; }
 
     let is_coro = vti.is_coroutine.load(Ordering::Acquire);
-    if is_coro {
-        // vsched2 requires Blocking before the context-save path commits the
-        // task to Blocked.  Setting Blocked here would bypass that protocol.
-        vti.set_state(libvsched2::TaskState::Blocking);
-        axlog::ax_println!("[toggle] coroutine → thread #{}", {
-            static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-            N.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
-        });
-        let stack = HANDLER_STACK[<super::smp::VschedSmpImpl as SMP>::cpu_id()].load(Ordering::Acquire);
-        vti.thread_stack_ptr.store(stack, Ordering::Release);
+    if promote {
+        if !is_coro {
+            // Ordinary vsched2 threads already own a persistent stack and do
+            // not need a coroutine conversion around block_on.
+            return false;
+        }
+        // take_current_stack() must be called while interrupts are disabled;
+        // block_on holds NoPreemptIrqSave around this callback.
+        let stack = libvsched2::take_current_stack();
+        assert!(!stack.is_null(), "toggle_handler: current stack is null");
+        vti.thread_stack_ptr.store(stack as usize, Ordering::Release);
+        // transition_block_on_task() has already committed Blocking.  vsched2
+        // will change it to Blocked only after the continuation is safe.
         vti.is_coroutine.store(false, Ordering::Release);
+        axlog::ax_println!("[block_on] coroutine -> thread task={:#x} stack={:#x}",
+            ptr as usize, stack as usize);
+        true
     } else {
-        axlog::ax_println!("[toggle] thread → coroutine");
+        if is_coro {
+            return false;
+        }
         vti.is_coroutine.store(true, Ordering::Release);
         vti.thread_stack_ptr.store(0, Ordering::Release);
+        axlog::ax_println!("[block_on] thread -> coroutine task={:#x}", ptr as usize);
+        true
     }
 }

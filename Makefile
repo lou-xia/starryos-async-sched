@@ -4,6 +4,13 @@ export LOG := warn
 export DWARF := y
 export MEMTRACK := n
 
+# vsched2 uses the mutable build-time constant CPU_NUM, while ArceOS exposes
+# the same setting as the make variable SMP.  Keep the kernel crate, generated
+# vDSO, and their per-CPU arrays on one value whenever SMP is explicitly set.
+ifneq ($(SMP),)
+export CPU_NUM := $(SMP)
+endif
+
 # QEMU Options
 export BLK := y
 export NET := y
