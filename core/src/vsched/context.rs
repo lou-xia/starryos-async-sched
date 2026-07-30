@@ -138,8 +138,28 @@ impl libvsched2::Context for VschedContextImpl {
         let tf_ptr = vsched_task.trap_frame.load(Ordering::Acquire);
         assert_ne!(tf_ptr, 0, "into_user_context: trap_frame is null");
         let tf = unsafe { &*(tf_ptr as *const UserTrapFrame) };
+        if tf.scause == 0 {
+            axlog::info!(
+                "[vsched2-diag] initial user restore task={:#x} axid={} name={} pid={} tf={:#x} satp={:#x} expected_root={:#x} vspace={:#x} vdso={:#x} sepc={:#x} sp={:#x} gp={:#x} tp={:#x} a0={:#x} sstatus={:#x}",
+                task as usize,
+                vsched_task.task.id().as_u64(),
+                vsched_task.task.name(),
+                vsched_task.pid.load(Ordering::Acquire),
+                tf_ptr,
+                axhal::asm::read_user_page_table().as_usize(),
+                vsched_task.user_page_table_root.load(Ordering::Acquire),
+                vsched_task.user_aspace_ptr.load(Ordering::Acquire),
+                vsched_task.user_vdso_base.load(Ordering::Acquire),
+                tf.sepc,
+                tf.regs.sp,
+                tf.regs.gp,
+                tf.regs.tp,
+                tf.regs.a0,
+                tf.sstatus,
+            );
+        }
         let spp = (tf.sstatus >> 8) & 1;
-// axlog::ax_println!(
+        // axlog::ax_println!(
         assert_eq!(
             spp, 0,
             "into_user_context: frame would return to supervisor mode",

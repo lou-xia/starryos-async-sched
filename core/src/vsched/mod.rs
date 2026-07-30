@@ -132,7 +132,10 @@ pub fn activate_vsched_trap_vector() {
 }
 
 pub fn push_task_to_kernel(task_ptr: *const ()) -> bool {
-    libvsched2::push_task_into_current(task_ptr)
+    // `push_task` selects the queue from Task::is_kernel().  Unlike
+    // `push_task_into_current`, this remains correct when a kernel service
+    // spawns a task while handling a user process on its behalf.
+    libvsched2::push_task(task_ptr)
 }
 
 /// Selects vsched2 before `starry_api::init()` creates background tasks.
@@ -140,7 +143,44 @@ pub fn push_task_to_kernel(task_ptr: *const ()) -> bool {
 /// The scheduler is not usable yet, so tasks created in this interval are
 /// retained by `PENDING_KERNEL_THREADS` and registered during bootstrap.
 pub fn prepare_vsched2() {
+    if VSCHED2_PREPARED.load(Ordering::Acquire) {
+        return;
+    }
+    axtask::register_external_scheduler_hooks(
+        external_spawn_kernel_thread,
+        task::exit_current_kernel_thread,
+        set_external_task_priority,
+        reject_external_task_affinity,
+    );
     VSCHED2_PREPARED.store(true, Ordering::Release);
+}
+
+fn external_spawn_kernel_thread(task: axtask::AxTaskRef) {
+    enqueue_kernel_thread(task, HIGHEST_PRIORITY + 1);
+}
+
+fn set_external_task_priority(priority: isize) -> bool {
+    if !(HIGHEST_PRIORITY..=LOWEST_PRIORITY).contains(&priority) {
+        return false;
+    }
+    let current = current_task_ptr() as *const task::VschedTaskImpl;
+    if current.is_null() {
+        return false;
+    }
+    let current = unsafe { &*current };
+    if !current.is_kernel.load(Ordering::Acquire) {
+        return false;
+    }
+    current.priority.store(priority, Ordering::Release);
+    true
+}
+
+fn reject_external_task_affinity(_cpumask: axtask::AxCpuMask) -> bool {
+    // vsched2 does not yet expose an affinity/migration operation.  Returning
+    // failure is preferable to updating only AxTask metadata or entering the
+    // legacy AxRunQueue migration path, both of which would claim semantics
+    // that the active scheduler cannot enforce.
+    false
 }
 
 fn register_kernel_thread(task: axtask::AxTaskRef, priority: isize) {
@@ -151,8 +191,30 @@ fn register_kernel_thread(task: axtask::AxTaskRef, priority: isize) {
     );
 }
 
-fn drain_pending_kernel_threads() {
-    let pending = core::mem::take(&mut *PENDING_KERNEL_THREADS.lock());
+fn enqueue_kernel_thread(task: axtask::AxTaskRef, priority: isize) {
+    axlog::info!(
+        "[vsched2] kernel task accepted: name={} priority={}",
+        task.name(),
+        priority
+    );
+    let mut pending = PENDING_KERNEL_THREADS.lock();
+    if !VSCHED2_SCHEDULER_READY.load(Ordering::Acquire) {
+        pending.push(PendingKernelThread { task, priority });
+        return;
+    }
+    drop(pending);
+    register_kernel_thread(task, priority);
+}
+
+fn enable_kernel_thread_registration() {
+    // Publish readiness and detach the pending list while holding the same
+    // lock used by enqueue_kernel_thread.  This closes the SMP window where a
+    // task could otherwise be appended after bootstrap had already drained.
+    let pending = {
+        let mut pending = PENDING_KERNEL_THREADS.lock();
+        VSCHED2_SCHEDULER_READY.store(true, Ordering::Release);
+        core::mem::take(&mut *pending)
+    };
     for PendingKernelThread { task, priority } in pending {
         register_kernel_thread(task, priority);
     }
@@ -177,14 +239,7 @@ where
     }
 
     let task = axtask::new_raw(entry, name, stack_size);
-    if VSCHED2_SCHEDULER_READY.load(Ordering::Acquire) {
-        register_kernel_thread(task.clone(), priority);
-    } else {
-        PENDING_KERNEL_THREADS.lock().push(PendingKernelThread {
-            task: task.clone(),
-            priority,
-        });
-    }
+    enqueue_kernel_thread(task.clone(), priority);
     task
 }
 
@@ -374,18 +429,24 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace: Option<*mut (
     axhal::asm::disable_irqs();
     init_vsched2_interfaces();
 
-    // Redirect axtask::yield_now() to vsched2's yield trampoline,
-    // replacing the legacy AxRunQueue yield with vsched2 resched.
-    unsafe extern "C" {
-        fn vsched_yield_trampoline() -> !;
-    }
-    axtask::register_vsched2_yield(vsched_yield_trampoline);
+    // Install the complete block_on backend before publishing vsched2 as
+    // active.  register_vsched2_yield() is the final Release publication;
+    // callers that observe it through vsched2_active()'s Acquire load must
+    // also observe every callback registered above it.
     axtask::register_block_on_toggle(trap::toggle_handler);
     axtask::register_block_on_hooks(
         current_block_on_task,
         wake_blocked_task,
         transition_block_on_task,
     );
+
+    // Redirect axtask::yield_now() to vsched2's yield trampoline, replacing
+    // the legacy AxRunQueue yield with vsched2 resched.  Keep this last: the
+    // same pointer is the scheduler-active flag used by block_on and timer code.
+    unsafe extern "C" {
+        fn vsched_yield_trampoline() -> !;
+    }
+    axtask::register_vsched2_yield(vsched_yield_trampoline);
 
     // Initialize empty AxRunQueue so legacy code paths (AxWaker, timer
     // tick, etc.) that deref it under vsched2 don't LazyInit-panic.
@@ -404,8 +465,7 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace: Option<*mut (
             .kernel_init_main
             .expect("kernel_init_main not in vtable")(init_stack_ptr, main_ptr as *const ());
     }
-    VSCHED2_SCHEDULER_READY.store(true, Ordering::Release);
-    drain_pending_kernel_threads();
+    enable_kernel_thread_registration();
 
     if let Some(init_task_ptr) = init_task_ptr {
         assert!(!init_task_ptr.is_null(), "vsched2 init task is null");
@@ -424,40 +484,9 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace: Option<*mut (
             // Copy kernel mappings into user AS so kernel code can execute
             // under the user page table without SATP switch on trap entry.
             {
-                let mut user_aspace = unsafe { &mut *(aspace_ptr as *mut axmm::AddrSpace) };
+                let user_aspace = unsafe { &mut *(aspace_ptr as *mut axmm::AddrSpace) };
                 let kernel_aspace = axmm::kernel_aspace().lock();
                 let _ = user_aspace.copy_mappings_from(&kernel_aspace);
-
-                // Fill the vDSO reserved gap so mmap won't allocate here
-// axlog::ax_println!("[vsched2] ext vdso_base={:#x} vdso_size={:#x}",
-                let vdso_base = user_aspace.vdso_base;
-                if vdso_base != 0 {
-                    let vdso_size = unsafe { vdso::VDSO_SIZE };
-                    let vdso_end = vdso_base + vdso_size;
-                    let highest = user_aspace.areas()
-                        .filter(|a| a.start().as_usize() >= vdso_base
-                                && a.end().as_usize() <= vdso_end)
-                        .map(|a| a.end().as_usize())
-                        .max()
-// axlog::ax_println!("[vsched2] ext highest={:#x} vdso_end={:#x}", highest, vdso_end);
-                        .unwrap_or(vdso_base);
-                    if highest < vdso_end {
-                        let gap = vdso_end - highest;
-                        user_aspace.map(
-                            memory_addr::VirtAddr::from(highest),
-                            gap,
-                            axhal::paging::MappingFlags::READ
-                                | axhal::paging::MappingFlags::WRITE
-                                | axhal::paging::MappingFlags::USER,
-                            false,
-                            axmm::backend::Backend::new_alloc(
-                                memory_addr::VirtAddr::from(highest),
-                                axhal::paging::PageSize::Size4K,
-                            ),
-// axlog::ax_println!("[vsched2] extended vdso reserved: {:#x}-{:#x} gap={:#x}", highest, vdso_end, gap);
-                        ).expect("vsched2: extend vdso reserved failed");
-                    }
-                }
             }
             if root.as_usize() != 0 && root != kernel_root {
                 unsafe {

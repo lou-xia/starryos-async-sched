@@ -9,12 +9,10 @@ echo
 echo -e "Use \e[1m\e[3mapk\e[0m to install packages."
 echo
 
-# Do your initialization here!
+TEST_DIR=/tests/target/riscv64gc-unknown-linux-musl/release
+echo "Running vsched2_test from $TEST_DIR"
+cd $TEST_DIR
+./vsched2_test
 
-# cd /tests/target/riscv64gc-unknown-linux-musl/release/
-# ./hello_world
-# cd /
-# rm -rf /tests
-# exit
 cd ~
 sh --login

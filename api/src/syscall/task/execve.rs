@@ -4,8 +4,7 @@ use core::ffi::c_char;
 use axerrno::{AxError, AxResult};
 use axfs::FS_CONTEXT;
 use axhal::uspace::UserContext;
-use axtask::current;
-use axtask::vsched2_active;
+use axtask::{current, vsched2_active};
 use starry_core::{config::USER_HEAP_BASE, mm::load_user_app, task::AsThread};
 use starry_vm::vm_load_until_nul;
 
@@ -16,11 +15,15 @@ pub fn sys_execve(
     path: *const c_char,
     argv: *const *const c_char,
     envp: *const *const c_char,
-// axlog::ax_println!("[execve] loading path...");
+    // axlog::ax_println!("[execve] loading path...");
 ) -> AxResult<isize> {
-// axlog::ax_println!("[execve] path={}", path);
+    // axlog::ax_println!("[execve] path={}", path);
     let path = vm_load_string(path)?;
-    axlog::ax_println!("[execve] ENTRY pid={} path={}", current().id().as_u64(), path);
+    axlog::info!(
+        "[execve] ENTRY pid={} path={}",
+        current().id().as_u64(),
+        path
+    );
 
     let args = if argv.is_null() {
         Vec::new()
@@ -49,11 +52,11 @@ pub fn sys_execve(
         error!("sys_execve: multi-thread not supported");
         return Err(AxError::WouldBlock);
     }
-// axlog::ax_println!("[execve] calling load_user_app for {}", path);
+    // axlog::ax_println!("[execve] calling load_user_app for {}", path);
 
     let mut aspace = proc_data.aspace.lock();
     match load_user_app(&mut aspace, Some(path.as_str()), &args, &envs) {
-// axlog::ax_println!("[execve] load_user_app OK entry={:#x} sp={:#x}",
+        // axlog::ax_println!("[execve] load_user_app OK entry={:#x} sp={:#x}",
         Ok((entry_point, user_stack_base)) => {
             let vspace = &raw const *aspace as *mut ();
 
@@ -75,11 +78,31 @@ pub fn sys_execve(
                 assert!(!trapped.is_null(), "execve: no trapped vsched task");
                 let task = unsafe { &*trapped };
                 let old_pid = task.pid.load(core::sync::atomic::Ordering::Acquire);
+                let new_vdso_base = aspace.vdso_base;
+                assert_ne!(
+                    new_vdso_base, 0,
+                    "execve: loaded user address space has no vDSO base"
+                );
+                // load_user_app() replaces the process vDSO in the existing
+                // AddrSpace.  Keep the task-side fast-path cache in sync before
+                // the new image can return to user scheduling.
+                task.user_vdso_base.store(
+                    new_vdso_base,
+                    core::sync::atomic::Ordering::Release,
+                );
                 let new_pid = starry_core::vsched::process_init(vspace);
                 starry_core::vsched::user_init_with_vspace(vspace);
-                task.pid.store(new_pid, core::sync::atomic::Ordering::Release);
+                task.pid
+                    .store(new_pid, core::sync::atomic::Ordering::Release);
+                axlog::info!(
+                    "[vsched2-diag] execve vDSO task={} aspace_vdso={:#x} task_vdso={:#x}",
+                    task.task.id_name(),
+                    aspace.vdso_base,
+                    task.user_vdso_base
+                        .load(core::sync::atomic::Ordering::Acquire),
+                );
                 starry_core::vsched::process_drop(old_pid);
-                axlog::ax_println!("[execve] vsched pid {} -> {}", old_pid, new_pid);
+                axlog::info!("[execve] vsched pid {} -> {}", old_pid, new_pid);
                 if root.as_usize() != 0 && root != kernel_root {
                     unsafe {
                         axhal::asm::write_user_page_table(kernel_root);
@@ -110,12 +133,12 @@ pub fn sys_execve(
             drop(fd_table);
 
             uctx.set_ip(entry_point.as_usize());
-// axlog::ax_println!("[execve] done, returning 0");
+            // axlog::ax_println!("[execve] done, returning 0");
             uctx.set_sp(user_stack_base.as_usize());
             Ok(0)
         }
         Err(e) => {
-// axlog::ax_println!("[execve] load_user_app FAILED: {:?}", e);
+            // axlog::ax_println!("[execve] load_user_app FAILED: {:?}", e);
             drop(aspace);
             Err(e)
         }

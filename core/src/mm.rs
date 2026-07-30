@@ -343,30 +343,6 @@ pub fn load_user_app(
     let vdso_start = VirtAddr::from(map_so(uspace_ptr) as usize);
     uspace.vdso_base = vdso_start.as_usize();
 
-    // Extend vDSO writable area to cover full VDSO_SIZE reserved space.
-    // This prevents musl mmap from allocating in the vDSO reserved gap.
-    {
-        let vdso_size = unsafe { vdso::VDSO_SIZE };
-        let vdso_reserved_end = vdso_start.as_usize() + vdso_size;
-        let highest = uspace
-            .areas()
-            .filter(|a| a.start().as_usize() >= vdso_start.as_usize())
-            .map(|a| a.end().as_usize())
-            .max()
-            .unwrap_or(vdso_start.as_usize());
-        if highest < vdso_reserved_end {
-            let gap = vdso_reserved_end - highest;
-            uspace.map(
-                VirtAddr::from(highest),
-                gap,
-                MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER,
-                true,
-                Backend::new_alloc(VirtAddr::from(highest), PageSize::Size4K),
-            )?;
-            axlog::ax_println!("[vdso] extended reserved: {:#x}-{:#x} gap={:#x}", highest, vdso_reserved_end, gap);
-        }
-    }
-
     // Pre-populate VDSO BSS areas (new_alloc backend) to avoid page faults
     {
         let areas_info: Vec<_> = uspace.areas().map(|a| (a.start(), a.end(), a.flags())).collect();

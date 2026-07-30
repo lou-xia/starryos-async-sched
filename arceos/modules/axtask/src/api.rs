@@ -11,10 +11,19 @@ use kernel_guard::NoPreemptIrqSave;
 /// Function pointer for vsched2 yield trampoline.
 /// When set (non-zero), `yield_now()` delegates to vsched2 instead of AxRunQueue.
 static VSCHED2_YIELD: AtomicUsize = AtomicUsize::new(0);
+/// Optional ownership hooks for a scheduler outside axtask.
+///
+/// Keeping these callbacks in axtask lets existing users of `spawn*`, `exit`,
+/// priority, and affinity retain their APIs without depending on StarryOS or
+/// libvsched2.  Once installed, a task must be owned by exactly one scheduler.
+static EXTERNAL_SPAWN: AtomicUsize = AtomicUsize::new(0);
+static EXTERNAL_EXIT: AtomicUsize = AtomicUsize::new(0);
+static EXTERNAL_SET_PRIORITY: AtomicUsize = AtomicUsize::new(0);
+static EXTERNAL_SET_AFFINITY: AtomicUsize = AtomicUsize::new(0);
 /// Context-conversion callback for the vsched2-aware `block_on` path.
 /// `true` promotes the current coroutine to a thread before yield; `false`
 /// restores a task promoted by the matching block_on invocation.
-pub(crate) static BLOCK_ON_TOGGLE: AtomicUsize = AtomicUsize::new(0);
+static BLOCK_ON_TOGGLE: AtomicUsize = AtomicUsize::new(0);
 
 /// Atomically starts or cancels the task-state part of a block operation.
 /// `true` commits Running -> Blocking; `false` cancels Blocking -> Running.
@@ -32,6 +41,29 @@ pub(crate) static BLOCK_ON_WAKE: AtomicUsize = AtomicUsize::new(0);
 /// will enter the vsched2 scheduler instead of the legacy AxRunQueue.
 pub fn register_vsched2_yield(yield_fn: unsafe extern "C" fn() -> !) {
     VSCHED2_YIELD.store(yield_fn as usize, core::sync::atomic::Ordering::Release);
+}
+
+/// Redirects task ownership operations to an external scheduler.
+///
+/// The spawn hook may be installed before the external scheduler is ready; its
+/// adapter is then responsible for retaining the task until bootstrap.  The
+/// other callbacks are only reached after externally scheduled tasks run.
+pub fn register_external_scheduler_hooks(
+    spawn: fn(AxTaskRef),
+    exit: fn(i32) -> !,
+    set_priority: fn(isize) -> bool,
+    set_affinity: fn(AxCpuMask) -> bool,
+) {
+    EXTERNAL_SPAWN.store(spawn as usize, core::sync::atomic::Ordering::Release);
+    EXTERNAL_EXIT.store(exit as usize, core::sync::atomic::Ordering::Release);
+    EXTERNAL_SET_PRIORITY.store(
+        set_priority as usize,
+        core::sync::atomic::Ordering::Release,
+    );
+    EXTERNAL_SET_AFFINITY.store(
+        set_affinity as usize,
+        core::sync::atomic::Ordering::Release,
+    );
 }
 
 /// Register the block_on context-conversion function.
@@ -61,6 +93,27 @@ pub(crate) fn block_on_current_task() -> Option<(*const (), usize)> {
     let current: fn() -> (*const (), usize) = unsafe { core::mem::transmute(ptr) };
     let (task, generation) = current();
     (!task.is_null()).then_some((task, generation))
+}
+
+/// Returns whether the externally scheduled `block_on` backend has been
+/// completely installed.  `VSCHED2_YIELD` is published only after this is
+/// true, so an active caller must never observe a partial backend.
+pub(crate) fn block_on_hooks_ready() -> bool {
+    BLOCK_ON_TOGGLE.load(core::sync::atomic::Ordering::Acquire) != 0
+        && BLOCK_ON_STATE.load(core::sync::atomic::Ordering::Acquire) != 0
+        && BLOCK_ON_CURRENT.load(core::sync::atomic::Ordering::Acquire) != 0
+        && BLOCK_ON_WAKE.load(core::sync::atomic::Ordering::Acquire) != 0
+}
+
+/// Promotes (`promote = true`) the current coroutine to a thread before a
+/// blocking yield, or restores it after its saved continuation resumes.
+pub(crate) fn toggle_block_on_task(promote: bool) -> Option<bool> {
+    let ptr = BLOCK_ON_TOGGLE.load(core::sync::atomic::Ordering::Acquire);
+    if ptr == 0 {
+        return None;
+    }
+    let toggle: fn(bool) -> bool = unsafe { core::mem::transmute(ptr) };
+    Some(toggle(promote))
 }
 
 pub(crate) fn wake_block_on_task(task: *const (), generation: usize) -> bool {
@@ -196,21 +249,28 @@ pub fn init_scheduler_secondary() {
 
 /// Handles periodic timer ticks for the task manager.
 ///
-/// If vsched2 is active, timer is handled by vsched2's trap entry; skip
-/// legacy AxRunQueue path entirely to avoid LazyInit panic.
+/// Timer callbacks and Future wakeups are scheduler-independent. If vsched2 is
+/// active, only the legacy AxRunQueue time-slice update is skipped.
 #[cfg(feature = "irq")]
 pub fn on_timer_tick() {
-    if vsched2_active() {
-        return;
-    }
+    // Timer Future callbacks are independent of scheduler ownership.  Only
+    // AxRunQueue's time-slice accounting is disabled under vsched2.
     crate::timers::check_events();
-    current_run_queue::<kernel_guard::NoOp>().scheduler_timer_tick();
+    if !vsched2_active() {
+        current_run_queue::<kernel_guard::NoOp>().scheduler_timer_tick();
+    }
 }
 
 /// Adds the given task to the run queue, returns the task reference.
 pub fn spawn_task(task: TaskInner) -> AxTaskRef {
     let task_ref = task.into_arc();
-    select_run_queue::<NoPreemptIrqSave>(&task_ref).add_task(task_ref.clone());
+    let hook = EXTERNAL_SPAWN.load(core::sync::atomic::Ordering::Acquire);
+    if hook == 0 {
+        select_run_queue::<NoPreemptIrqSave>(&task_ref).add_task(task_ref.clone());
+    } else {
+        let spawn: fn(AxTaskRef) = unsafe { core::mem::transmute(hook) };
+        spawn(task_ref.clone());
+    }
     task_ref
 }
 
@@ -272,7 +332,13 @@ where
 ///
 /// [CFS]: https://en.wikipedia.org/wiki/Completely_Fair_Scheduler
 pub fn set_priority(prio: isize) -> bool {
-    current_run_queue::<NoPreemptIrqSave>().set_current_priority(prio)
+    let hook = EXTERNAL_SET_PRIORITY.load(core::sync::atomic::Ordering::Acquire);
+    if hook == 0 {
+        current_run_queue::<NoPreemptIrqSave>().set_current_priority(prio)
+    } else {
+        let set_priority: fn(isize) -> bool = unsafe { core::mem::transmute(hook) };
+        set_priority(prio)
+    }
 }
 
 /// Temporarily override the current task for the duration of `f`.
@@ -331,12 +397,27 @@ pub fn run_task_entry_for_external_scheduler(task: &AxTaskRef) {
     task.run_entry_for_external_scheduler();
 }
 
+/// Completes the axtask-visible part of an externally scheduled task's exit.
+///
+/// The external scheduler remains responsible for removing its own execution
+/// context and rescheduling.  This helper only publishes the exit code and
+/// wakes a joiner using axtask's existing protocol.
+pub fn notify_exit_for_external_scheduler(task: &AxTaskRef, exit_code: i32) {
+    task.notify_exit(exit_code);
+}
+
 /// Set the affinity for the current task.
 /// [`AxCpuMask`] is used to specify the CPU affinity.
 /// Returns `true` if the affinity is set successfully.
 ///
 /// TODO: support set the affinity for other tasks.
 pub fn set_current_affinity(cpumask: AxCpuMask) -> bool {
+    let hook = EXTERNAL_SET_AFFINITY.load(core::sync::atomic::Ordering::Acquire);
+    if hook != 0 {
+        let set_affinity: fn(AxCpuMask) -> bool = unsafe { core::mem::transmute(hook) };
+        return set_affinity(cpumask);
+    }
+
     if cpumask.is_empty() {
         false
     } else {
@@ -403,7 +484,13 @@ pub fn sleep_until(deadline: axhal::time::TimeValue) {
 
 /// Exits the current task.
 pub fn exit(exit_code: i32) -> ! {
-    current_run_queue::<NoPreemptIrqSave>().exit_current(exit_code)
+    let hook = EXTERNAL_EXIT.load(core::sync::atomic::Ordering::Acquire);
+    if hook == 0 {
+        current_run_queue::<NoPreemptIrqSave>().exit_current(exit_code)
+    } else {
+        let exit: fn(i32) -> ! = unsafe { core::mem::transmute(hook) };
+        exit(exit_code)
+    }
 }
 
 /// The idle task routine.

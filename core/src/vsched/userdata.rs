@@ -21,7 +21,10 @@ use axmm::AddrSpace;
 use libvsched2::SMP;
 use memory_addr::{PhysAddr, VirtAddr};
 
-use super::{VSCHED2_VDSO_SIZE, VSCHED2_VDSO_START_PA, VSCHED2_VVAR_SIZE, VSCHED2_VVAR_START_PA, context::CURRENT_VDSO_BASE, smp::VschedSmpImpl};
+use super::{
+    VSCHED2_VDSO_SIZE, VSCHED2_VDSO_START_PA, VSCHED2_VVAR_SIZE, VSCHED2_VVAR_START_PA,
+    context::CURRENT_VDSO_BASE, smp::VschedSmpImpl,
+};
 
 pub struct VschedUserDataImpl;
 

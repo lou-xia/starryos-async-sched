@@ -277,6 +277,10 @@ impl AddrSpace {
     /// Removes all mappings in the address space.
     pub fn clear(&mut self) {
         self.areas.clear(&mut self.pt).unwrap();
+        // The vDSO mapping was part of the cleared areas.  Do not leave a
+        // non-zero base that points at an unmapped region while a new image is
+        // being loaded or after loading fails.
+        self.vdso_base = 0;
     }
 
     /// Checks whether an access to the specified memory region is valid.
@@ -375,6 +379,10 @@ impl AddrSpace {
         let new_aspace_clone = new_aspace.clone();
 
         let mut guard = new_aspace.lock();
+        // The cloned mappings still contain the inherited vDSO/VVAR region.
+        // Preserve its base metadata as well so callers can find or replace
+        // that region before installing a private child copy.
+        guard.vdso_base = self.vdso_base;
 
         let mut self_modify = self.pt.modify();
         for area in self.areas.iter() {

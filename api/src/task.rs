@@ -24,7 +24,7 @@ use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
     signal::{check_signals, unblock_next_signal},
-    syscall::{SyscallOutcome, handle_syscall},
+    syscall::handle_syscall,
 };
 
 /// Create a new user task.
@@ -125,6 +125,10 @@ pub fn new_vsched_user_task(
     let pid = thr.proc_data.proc.pid() as usize;
     let user_root = thr.proc_data.aspace.lock().page_table_root().as_usize();
     let vdso_base = thr.proc_data.aspace.lock().vdso_base;
+    assert_ne!(
+        vdso_base, 0,
+        "new_vsched_user_task: user address space has no vDSO base"
+    );
     let aspace_mutex_ptr = Arc::as_ptr(&thr.proc_data.aspace) as usize;
 
     // Copy ALL parent registers (clone/fork semantics: child shares parent state)
@@ -352,6 +356,10 @@ fn vsched_trap_dispatcher(
                 VirtAddr::from(tf.regs.sp),
                 tf.regs.a0,
             );
+            // UserContext::new initializes only sp/a0 and clears the other
+            // GPRs.  clone/fork must receive the complete trapped register
+            // set so the child inherits gp and the callee-saved registers.
+            uctx.regs = unsafe { core::mem::transmute_copy(&tf.regs) };
             uctx.set_arg1(tf.regs.a1);
             uctx.set_arg2(tf.regs.a2);
             uctx.set_arg3(tf.regs.a3);
@@ -360,12 +368,7 @@ fn vsched_trap_dispatcher(
             uctx.set_sysno(tf.regs.a7);
             uctx.set_ra(tf.regs.ra);
             uctx.set_tls(tf.regs.tp);
-            let outcome = handle_syscall(&mut uctx);
-            assert_eq!(
-                outcome,
-                SyscallOutcome::Complete,
-                "TrapHandler returned from a syscall before its block_on completed"
-            );
+            handle_syscall(&mut uctx);
 
             if vti.task.state() != axtask::TaskState::Exited {
                 let tf_mut = unsafe { &mut *(tf_ptr as *mut UserTrapFrame) };
@@ -421,6 +424,25 @@ fn vsched_trap_dispatcher(
 // axlog::ax_println!("[pf] vaddr={:#x} fixed={} scause={}", tf.stval, fixed, tf.scause);
             };
             if !fixed {
+                let current = axtask::current();
+                axlog::warn!(
+                    "[vsched2-diag] unhandled page fault trapped={:#x} task={} axid={} pid={} current={} current_axid={} satp={:#x} expected_root={:#x} tf={:#x} scause={:#x} stval={:#x} sepc={:#x} sp={:#x} a0={:#x} signal_task={}",
+                    trapped_task as usize,
+                    vti.task.id_name(),
+                    vti.task.id().as_u64(),
+                    vti.pid.load(Ordering::Acquire),
+                    current.id_name(),
+                    current.id().as_u64(),
+                    axhal::asm::read_user_page_table().as_usize(),
+                    vti.user_page_table_root.load(Ordering::Acquire),
+                    tf_ptr,
+                    tf.scause,
+                    tf.stval,
+                    tf.sepc,
+                    tf.regs.sp,
+                    tf.regs.a0,
+                    signal_task.id_name(),
+                );
                 raise_signal_fatal_for_task(&signal_task, SignalInfo::new_kernel(Signo::SIGSEGV)).ok();
             }
         }

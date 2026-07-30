@@ -36,19 +36,14 @@ pub fn get_last_trapped_user_task() -> *const VschedTaskImpl {
             return owner as *const VschedTaskImpl;
         }
     }
-    LAST_TRAPPED_USER_TASK[<super::smp::VschedSmpImpl as SMP>::cpu_id()]
-        .load(Ordering::Acquire) as *const VschedTaskImpl
+    LAST_TRAPPED_USER_TASK[<super::smp::VschedSmpImpl as SMP>::cpu_id()].load(Ordering::Acquire)
+        as *const VschedTaskImpl
 }
 
 /// Clears a cached user task only if it is still the cache owner.
 fn clear_last_trapped_user_task(task: *const VschedTaskImpl) {
     let slot = &LAST_TRAPPED_USER_TASK[<super::smp::VschedSmpImpl as SMP>::cpu_id()];
-    let _ = slot.compare_exchange(
-        task as usize,
-        0,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    );
+    let _ = slot.compare_exchange(task as usize, 0, Ordering::AcqRel, Ordering::Acquire);
 }
 
 static TRAP_DISPATCHER: AtomicUsize = AtomicUsize::new(0);
@@ -148,27 +143,27 @@ impl libvsched2::TrapInfo for VschedTrapInfoImpl {
         unsafe { drop(Box::from_raw(ptr)) };
     }
 
-// axlog::ax_println!("[new_handler] START queue={:#x}", queue as usize);
+    // axlog::ax_println!("[new_handler] START queue={:#x}", queue as usize);
     fn new_handler(queue: *const ()) -> *const () {
         let handler_fn = unsafe {
             libvsched2::VDSO_VTABLE
                 .trap_handler
                 .expect("trap_handler not in vtable")
-// axlog::ax_println!("[new_handler] got handler_fn, creating task");
+            // axlog::ax_println!("[new_handler] got handler_fn, creating task");
         };
         let task_ref = axtask::new_raw(
             || {},
             alloc::string::String::from("trap_handler"),
             config::KERNEL_STACK_SIZE,
-// axlog::ax_println!("[new_handler] axtask::new_raw done");
+            // axlog::ax_println!("[new_handler] axtask::new_raw done");
         );
         task_ref.set_state(AxTaskState::Blocked);
         let coro = Arc::new(TrapHandlerCoroutine {
             handler_fn: AtomicUsize::new(handler_fn as usize),
             queue: AtomicUsize::new(queue as usize),
-// axlog::ax_println!("[new_handler] about to register_task");
+            // axlog::ax_println!("[new_handler] about to register_task");
         });
-// axlog::ax_println!("[new_handler] DONE ptr={:#x}", ptr as usize);
+        // axlog::ax_println!("[new_handler] DONE ptr={:#x}", ptr as usize);
         let ptr = register_task(task_ref, HIGHEST_PRIORITY, 0, true, Some(coro), 0);
         ptr as *const ()
     }
@@ -225,7 +220,7 @@ pub fn toggle_handler(promote: bool) -> bool {
         // will change it to Blocked only after the common yield entry has
         // detached the continuation stack from this CPU.
         vti.is_coroutine.store(false, Ordering::Release);
-        axlog::ax_println!("[block_on] coroutine -> thread task={:#x}", ptr as usize);
+        axlog::info!("[block_on] coroutine -> thread task={:#x}", ptr as usize);
         true
     } else {
         if is_coro {
@@ -233,7 +228,7 @@ pub fn toggle_handler(promote: bool) -> bool {
         }
         vti.is_coroutine.store(true, Ordering::Release);
         vti.thread_stack_ptr.store(0, Ordering::Release);
-        axlog::ax_println!("[block_on] thread -> coroutine task={:#x}", ptr as usize);
+        axlog::info!("[block_on] thread -> coroutine task={:#x}", ptr as usize);
         true
     }
 }

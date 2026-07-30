@@ -12,8 +12,9 @@ use libvsched2::Stack as _;
 use spin::Mutex;
 
 use super::{
-    from_vsched_state, to_vsched_state,
+    from_vsched_state,
     stack::VschedStackImpl,
+    to_vsched_state,
     trapframe::{UserGeneralRegs, UserTrapFrame, UserTrapFrameKind},
 };
 
@@ -159,7 +160,10 @@ impl VschedTaskImpl {
         assert!(!owner.is_null(), "bind_execution_task: null owner");
         let owner = unsafe { &*owner };
         let mut slot = self.execution_task.lock();
-        assert!(slot.is_none(), "trap handler already has an execution owner");
+        assert!(
+            slot.is_none(),
+            "trap handler already has an execution owner"
+        );
         *slot = Some(owner.task.clone());
         drop(slot);
         self.trap_owner
@@ -191,9 +195,7 @@ impl VschedTaskImpl {
     /// `set_current_stack()` 会有意得到 `None`，避免把同一栈再次当成可回收
     /// 的旧栈。中断处理仍使用 `sscratch` 中的 trap 栈。
     pub fn promote_interrupted_kernel_coroutine(&self) -> bool {
-        if !self.is_kernel.load(Ordering::Acquire)
-            || !self.is_coroutine.load(Ordering::Acquire)
-        {
+        if !self.is_kernel.load(Ordering::Acquire) || !self.is_coroutine.load(Ordering::Acquire) {
             return false;
         }
         assert!(
@@ -206,7 +208,8 @@ impl VschedTaskImpl {
             !stack.is_null(),
             "interrupted coroutine has no current stack"
         );
-        self.thread_stack_ptr.store(stack as usize, Ordering::Release);
+        self.thread_stack_ptr
+            .store(stack as usize, Ordering::Release);
         self.resume_to_coroutine.store(true, Ordering::Release);
         self.is_coroutine.store(false, Ordering::Release);
         true
@@ -355,13 +358,37 @@ impl libvsched2::Task for VschedTaskImpl {
 /// vsched2 thread context-save path.
 extern "C" fn kernel_thread_entry() -> ! {
     let current = libvsched2::current_task_ptr() as *const VschedTaskImpl;
-    assert!(!current.is_null(), "kernel_thread_entry: no vsched2 current task");
+    assert!(
+        !current.is_null(),
+        "kernel_thread_entry: no vsched2 current task"
+    );
     let task = unsafe { &*current };
     axtask::run_task_entry_for_external_scheduler(&task.task);
 
+    finish_kernel_thread(task, 0)
+}
+
+/// Completes an explicit `axtask::exit()` without entering AxRunQueue.
+pub fn exit_current_kernel_thread(exit_code: i32) -> ! {
+    let current = libvsched2::current_task_ptr() as *const VschedTaskImpl;
+    assert!(
+        !current.is_null(),
+        "exit_current_kernel_thread: no vsched2 current task"
+    );
+    let task = unsafe { &*current };
+    assert!(
+        task.is_kernel.load(Ordering::Acquire),
+        "axtask::exit may only exit the current vsched2 kernel task"
+    );
+    finish_kernel_thread(task, exit_code)
+}
+
+fn finish_kernel_thread(task: &VschedTaskImpl, exit_code: i32) -> ! {
     axhal::asm::disable_irqs();
-    use libvsched2::{Task as _, TaskState};
-    task.set_state(TaskState::Exited);
+    task.wake_generation.fetch_add(1, Ordering::AcqRel);
+    axtask::notify_exit_for_external_scheduler(&task.task, exit_code);
+
+    use libvsched2::Task as _;
     task.resched();
     unreachable!()
 }
@@ -420,18 +447,12 @@ pub fn register_task(
         None
     };
     let vti = Box::new(VschedTaskImpl::new(
-        task,
-        priority,
-        pid,
-        is_kernel,
-        coroutine,
+        task, priority, pid, is_kernel, coroutine,
     ));
     vti.user_vdso_base.store(vdso_base, Ordering::Release);
     if is_thread {
-        vti.thread_stack_ptr.store(
-            VschedStackImpl::alloc() as usize,
-            Ordering::Release,
-        );
+        vti.thread_stack_ptr
+            .store(VschedStackImpl::alloc() as usize, Ordering::Release);
     }
     if let Some(frame) = initial_frame {
         vti.trap_frame

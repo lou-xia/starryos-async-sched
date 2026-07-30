@@ -13,6 +13,8 @@ memory_addr.workspace = true
 axlog.workspace = true
 axerrno.workspace = true
 axsync.workspace = true
+include_bytes_aligned = "0.1.4"
+xmas-elf = "0.9"
 
 [build-dependencies]
 build_vdso = { path = "../../vdso_crate_template/vdso_crate_template/build_vdso" }

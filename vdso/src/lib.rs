@@ -13,11 +13,35 @@ pub static mut VDSO_SIZE: usize = 0;
 pub static mut VVAR_START_PA: usize = 0;
 pub static mut VVAR_SIZE: usize = 0;
 
-const VDSO_IMAGE: &[u8] = include_bytes!("../../vdso_vsched2_output/libvsched2.so");
-
-const VDSO_RESERVED_SIZE: usize = align_up_4k(VDSO_IMAGE.len()) + PAGE_SIZE_4K;
+const VDSO_IMAGE: &[u8] =
+    include_bytes_aligned::include_bytes_aligned!(8, "../../vdso_vsched2_output/libvsched2.so");
 
 const VVAR_RESERVED_SIZE: usize = align_up_4k(core::mem::size_of::<VvarData>());
+
+/// Returns the page-aligned virtual span occupied by the ELF `PT_LOAD`
+/// segments. `p_memsz` already includes `.bss`; file-only sections such as
+/// `.symtab` and `.strtab` must not enlarge the mapped vDSO range.
+fn vdso_runtime_size() -> usize {
+    let elf = xmas_elf::ElfFile::new(VDSO_IMAGE).expect("vdso: invalid ELF image");
+    let mut runtime_start = usize::MAX;
+    let mut runtime_end = 0usize;
+
+    for ph in elf
+        .program_iter()
+        .filter(|ph| ph.get_type() == Ok(xmas_elf::program::Type::Load))
+    {
+        let start = (ph.virtual_addr() as usize) & !(PAGE_SIZE_4K - 1);
+        let end = align_up_4k((ph.virtual_addr() + ph.mem_size()) as usize);
+        runtime_start = runtime_start.min(start);
+        runtime_end = runtime_end.max(end);
+    }
+
+    assert_ne!(runtime_start, usize::MAX, "vdso: ELF has no PT_LOAD segment");
+    // The generated loader treats map_so()'s return value as the ELF load
+    // bias, so the loadable ET_DYN image is required to begin at offset zero.
+    assert_eq!(runtime_start, 0, "vdso: PT_LOAD span must start at offset zero");
+    runtime_end - runtime_start
+}
 
 struct MemImpl;
 
@@ -31,6 +55,9 @@ impl MemIf for MemImpl {
     fn valloc(vspace: usize, size: usize) -> *mut u8 {
         let aspace = aspace_from_vspace(vspace);
         let area = VirtAddrRange::new(aspace.base(), aspace.end());
+        // Keep StarryOS's placement decision consistent with the ELF runtime
+        // span even if a generated loader computes its request differently.
+        let size = size.max(VVAR_RESERVED_SIZE + vdso_runtime_size());
         aspace
             .find_free_area(aspace.base(), size, area, PAGE_SIZE_4K)
             .unwrap_or_else(|| {
@@ -115,7 +142,7 @@ pub fn vdso_init() {
         VVAR_START_PA = usize::from(virt_to_phys(VirtAddr::from(vvar_start as usize)));
         VVAR_SIZE = VVAR_RESERVED_SIZE;
         VDSO_START_PA = usize::from(virt_to_phys(VirtAddr::from(vdso_start as usize)));
-        VDSO_SIZE = VDSO_RESERVED_SIZE;
+        VDSO_SIZE = vdso_runtime_size();
     };
     let vvar_kernel_expected =
         phys_to_virt(PhysAddr::from(unsafe { VDSO_START_PA })).as_usize() - unsafe { VVAR_SIZE };

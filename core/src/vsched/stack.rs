@@ -39,9 +39,10 @@ impl libvsched2::Stack for VschedStackImpl {
             (*self_ptr).magic = VSI_MAGIC;
             (*self_ptr).base = buffer_top as *mut ();
         }
-        axlog::ax_println!(
+        axlog::info!(
             "[stack::alloc] vsi={:#x} base={:#x}",
-            self_ptr as usize, buffer_top as usize,
+            self_ptr as usize,
+            buffer_top as usize,
         );
         self_ptr as *mut ()
     }
@@ -55,7 +56,9 @@ impl libvsched2::Stack for VschedStackImpl {
         let ptr = self as *mut Self as *mut u8;
         self.magic = 0;
         self.base = core::ptr::null_mut();
-        unsafe { dealloc(ptr, total_layout); }
+        unsafe {
+            dealloc(ptr, total_layout);
+        }
     }
 
     fn base(&self) -> *mut () {

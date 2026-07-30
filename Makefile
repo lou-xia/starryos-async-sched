@@ -81,6 +81,10 @@ test: uapp copy_tests
 	@rm -f .axconfig.toml
 	@make -C arceos run
 
+# The assertions below intentionally inspect migration diagnostics emitted at
+# info level. Keep the normal runtime default at warn and raise it only for this
+# verification target (including its build prerequisite).
+verify-vsched2: LOG := info
 verify-vsched2: build
 	@bash scripts/check-vsched2-log.sh
 

@@ -135,7 +135,9 @@ vsched2_trap_vector:
 #[unsafe(no_mangle)]
 extern "C" fn vsched2_direct_entry_stub(trap_type: usize, privilege: usize) -> ! {
     let entry = unsafe {
-        libvsched2::VDSO_VTABLE.raw_trap_entry.expect("raw_trap_entry not in vtable")
+        libvsched2::VDSO_VTABLE
+            .raw_trap_entry
+            .expect("raw_trap_entry not in vtable")
     };
     unsafe {
         core::arch::asm!(
@@ -149,8 +151,10 @@ extern "C" fn vsched2_direct_entry_stub(trap_type: usize, privilege: usize) -> !
 
 #[unsafe(no_mangle)]
 extern "C" fn vsched2_trap_entry_stub(
-    trap_type: usize, privilege: usize,
-    tf_stack: *const UserTrapFrame, task_ptr: *const (),
+    trap_type: usize,
+    privilege: usize,
+    tf_stack: *const UserTrapFrame,
+    task_ptr: *const (),
 ) -> ! {
     let tf = unsafe { &*tf_stack };
     match tf.scause {
@@ -175,7 +179,9 @@ extern "C" fn vsched2_trap_entry_stub(
     }
 
     let mut task_ptr = task_ptr;
-    if task_ptr.is_null() { task_ptr = libvsched2::current_task_ptr(); }
+    if task_ptr.is_null() {
+        task_ptr = libvsched2::current_task_ptr();
+    }
     if !task_ptr.is_null() {
         let vti = unsafe { &*(task_ptr as *const VschedTaskImpl) };
         if trap_type == 1 {
@@ -196,7 +202,9 @@ extern "C" fn vsched2_trap_entry_stub(
     }
 
     let entry = unsafe {
-        libvsched2::VDSO_VTABLE.raw_trap_entry.expect("raw_trap_entry not in vtable")
+        libvsched2::VDSO_VTABLE
+            .raw_trap_entry
+            .expect("raw_trap_entry not in vtable")
     };
     unsafe {
         core::arch::asm!(
@@ -215,20 +223,34 @@ extern "C" fn vsched2_trap_entry_stub(
 unsafe extern "C" fn vsched_yield_trampoline() -> ! {
     core::arch::naked_asm!(
         "addi   sp, sp, -296",
-        "sd     ra, 8(sp)",  "addi   t0, sp, 296", "sd     t0, 16(sp)",
-        "sd     s0, 64(sp)",  "sd     s1, 72(sp)",
-        "sd     s2, 144(sp)", "sd     s3, 152(sp)", "sd     s4, 160(sp)",
-        "sd     s5, 168(sp)", "sd     s6, 176(sp)", "sd     s7, 184(sp)",
-        "sd     s8, 192(sp)", "sd     s9, 200(sp)", "sd     s10, 208(sp)",
+        "sd     ra, 8(sp)",
+        "addi   t0, sp, 296",
+        "sd     t0, 16(sp)",
+        "sd     s0, 64(sp)",
+        "sd     s1, 72(sp)",
+        "sd     s2, 144(sp)",
+        "sd     s3, 152(sp)",
+        "sd     s4, 160(sp)",
+        "sd     s5, 168(sp)",
+        "sd     s6, 176(sp)",
+        "sd     s7, 184(sp)",
+        "sd     s8, 192(sp)",
+        "sd     s9, 200(sp)",
+        "sd     s10, 208(sp)",
         "sd     s11, 216(sp)",
         // sepc = ra (return address, so task resumes after yield)
         "sd     ra, 256(sp)",
         // sstatus = current sstatus with SPP=1 so sret goes to S-mode
-        "csrr   t0, sstatus", "ori    t0, t0, 0x100", "sd     t0, 264(sp)",
+        "csrr   t0, sstatus",
+        "ori    t0, t0, 0x100",
+        "sd     t0, 264(sp)",
         // scause/stval = 0 (no trap), kind = 0 (Yield)
-        "sd     zero, 272(sp)", "sd     zero, 280(sp)",
-        "li     t0, 0", "sd     t0, 288(sp)",
-        "mv     a0, sp", "call   vsched_yield_entry_stub",
+        "sd     zero, 272(sp)",
+        "sd     zero, 280(sp)",
+        "li     t0, 0",
+        "sd     t0, 288(sp)",
+        "mv     a0, sp",
+        "call   vsched_yield_entry_stub",
     )
 }
 
@@ -260,16 +282,15 @@ extern "C" fn vsched_yield_entry_stub(tf_stack: *const UserTrapFrame) -> ! {
         // stable trap frame；线程栈也必须在进入 raw_thread_entry 前从
         // per-CPU current_stack 中取出并归还任务。协程的普通 resched 会
         // 丢弃本轮 poll continuation，因此仍保留 current_stack 供复用。
-        if !vti
-            .is_coroutine
-            .load(core::sync::atomic::Ordering::Acquire)
-        {
+        if !vti.is_coroutine.load(core::sync::atomic::Ordering::Acquire) {
             vti.detach_thread_stack_for_resched();
         }
     }
 
     let entry = unsafe {
-        libvsched2::VDSO_VTABLE.raw_thread_entry.expect("raw_thread_entry not in vtable")
+        libvsched2::VDSO_VTABLE
+            .raw_thread_entry
+            .expect("raw_thread_entry not in vtable")
     };
     entry();
 }
@@ -278,17 +299,13 @@ extern "C" fn vsched_yield_entry_stub(tf_stack: *const UserTrapFrame) -> ! {
 ///
 /// 用户任务通常在创建时已经分配了frame；内核handler第一次yield时才按需分配。
 /// compare_exchange使首次分配在后续多核场景下也不会安装两个不同的frame。
-fn save_task_trap_frame(
-    task: &VschedTaskImpl,
-    source: *const UserTrapFrame,
-) -> *mut UserTrapFrame {
+fn save_task_trap_frame(task: &VschedTaskImpl, source: *const UserTrapFrame) -> *mut UserTrapFrame {
     use core::sync::atomic::Ordering;
 
     let mut destination = task.trap_frame.load(Ordering::Acquire) as *mut UserTrapFrame;
     if destination.is_null() {
-        let allocated = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(unsafe {
-            core::ptr::read(source)
-        }));
+        let allocated =
+            alloc::boxed::Box::into_raw(alloc::boxed::Box::new(unsafe { core::ptr::read(source) }));
         match task.trap_frame.compare_exchange(
             0,
             allocated as usize,

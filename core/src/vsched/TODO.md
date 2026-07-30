@@ -38,6 +38,10 @@
   旧启动脚本中 `exit` 结束 QEMU 的生命周期语义，普通子进程退出仍只唤醒 `wait4`；
 - 线程主动让权时已统一在 StarryOS yield 入口移交 continuation 栈；vsched2 对线程在单核和
   多核都先切到独立 empty stack，再提交状态和进入调度循环。
+- vsched2 syscall dispatcher 已在构造 `UserContext` 时复制完整 trapped GPR；传统 `fork()`
+  child 不再因 `gp=0` 在首个 syscall 前访问 `0x194`，最小 `_exit/waitpid` 回归通过；
+- `AddrSpace::try_clone/clear`、fork 私有 vDSO 重映射和 execve 已形成完整 `vdso_base`
+  生命周期；`AddrSpace.vdso_base` 与 `VschedTaskImpl.user_vdso_base` 在任务可运行前保持同步。
 
 ### 1.2 当前验证边界与直接阻塞点
 
@@ -500,7 +504,47 @@ PLIC/UART IRQ hook
 相对路径 `mkdir`、重定向和 `cat`。管道可传输数据但结束/等待链不能收敛；连续输入、信号和
 长时间空闲后的完整压力测试仍按下节执行。
 
-### 4.8 后续验收标准
+### 4.8 WFI 的周期性 timer 唤醒不是忙转
+
+2026-07-28 在 `wait_irqs()` 的 `wfi` 前加入 `warn!` 后，日志约每 10 ms 出现一次：
+
+```text
+wait_irqs: waiting for interrupts...
+（约 10 ms）
+wait_irqs: waiting for interrupts...
+```
+
+这符合当前配置，不表示 WFI 失效。StarryOS 的 `TICKS_PER_SEC` 为 100，`axruntime` 每
+`NANOS_PER_SEC / 100 = 10 ms` 安装一次 timer deadline。一次空闲周期的实际流程是：
+
+```text
+无 Ready 任务
+  -> 输出日志并打开本 hart 中断
+  -> WFI，CPU 在两次日志之间休眠
+  -> 约 10 ms 后 supervisor timer interrupt 到达
+  -> 低层入口暂时把 stimecmp 设为 u64::MAX，抑制旧 pending 源
+  -> 延迟执行 timer handler，并安装下一个 10 ms deadline
+  -> 没有任务被唤醒，再次进入 wait_irqs/WFI
+```
+
+WFI 只保证等待某个可唤醒事件，不保证一直等到“业务任务变为 Ready”；timer、external IRQ、
+IPI 都可以令它返回，而且 RISC-V 规范允许实现把 WFI 当作 hint。当前日志间隔稳定在 10 ms，
+与系统 tick 完全一致，反而说明 QEMU 中的 WFI 确实在等待 timer。若是 pending 未清或 WFI
+退化为忙转，通常会看到几乎没有时间间隔的连续输出；后续诊断可同时记录 `scause` 和每秒
+WFI/timer/external/IPI 计数来区分。该 `warn!` 是高频测试日志，验证完成后应删除、降为
+`trace!` 或限频，避免串口输出反过来扰动调度时序。
+
+如果后续希望空闲 CPU 不被固定 100 Hz tick 唤醒，需要改的是 timer 策略而不是 WFI：实现
+tickless idle，根据软件 timer wheel/alarm 中最早的真实 deadline 设置 `stimecmp`，没有
+deadline 时才设置为最大值；同时保留时间记账、signal timer 和多核 timer owner 语义。该项
+属于能耗/空闲优化，不是当前单核正确性阻塞点。
+
+此前还存在与 WFI 不同层的软件 timer 事件问题：硬件 timer handler 会安装下一次 deadline，
+所以 WFI 每 10 ms 正常唤醒；`axtask::on_timer_tick()` 却在 vsched2 激活时整体提前返回，导致
+软件 timer wheel 不执行 `check_events()`。2026-07-29 已在 P0-1 中拆分两种职责：始终检查
+软件 timer 事件，只跳过 AxRunQueue 的时间片 tick。具体 sleep/timeout 语义仍按 P0-2 分类验证。
+
+### 4.9 后续验收标准
 
 - `make run` 后 BusyBox prompt 可以持续读取键盘输入；
 - 输入前空闲任意时间后仍能立即响应；
@@ -529,55 +573,124 @@ ls
 
 优先级含义：P0 是当前主线必须先闭环的正确性问题；P1 是紧随其后的多核与生命周期安全；
 P2 是语义完整性、公平性和兼容性；P3 是不阻塞当前功能的长期演进与文档清理。P0 内部严格
-按 5.1、5.2、5.3 的顺序推进，不再把多核、回收或公平性与它们并列。
+按 P0-1、P0-2、P0-3、P0-4 的顺序推进，不再把多核、回收或公平性与它们并列。
 
-### 5.1 P0-1：消除对 AxRunQueue 的运行时依赖（最优先）
+### 5.1 P0-1：消除对 AxRunQueue 的运行时依赖（单核主路径已修复）
 
-tty-reader 已迁入 vsched2，但其它后台任务和通用任务 API 仍可能只把任务放进 AxRunQueue：
+2026-07-29 已在 StarryOS/axtask 适配层完成，不修改 vsched2 调度接口：
 
-| 任务/接口 | 影响 |
-|---|---|
-| `dev-log-server` | `/dev/log` 服务不运行 |
-| `alarm_task` | alarm 和 signal timer 不推进 |
-| `fb-refresh` | framebuffer 刷新不运行 |
-| `vsock-poll` | vsock 轮询不运行 |
-| ArceOS/POSIX spawn/join/exit | 内核任务创建、等待与退出协议尚未统一 |
-| AxRunQueue gc/idle/migration | 生命周期、SMP 和 affinity 仍属于旧调度器 |
+1. axtask 新增通用 external-scheduler ownership hooks。`prepare_vsched2()` 在
+   `starry_api::init()` 前注册后，既有 `spawn/spawn_raw/spawn_with_name` API 自动把新内核
+   任务交给 StarryOS 适配器；`api`、`axnet`、POSIX 层不需要反向依赖 `starry-core`，任务也
+   不会同时进入两个调度器。
+2. 启动期任务继续使用 `PENDING_KERNEL_THREADS`，但 scheduler-ready 的发布和 pending drain
+   现在与 enqueue 使用同一把锁，封闭多核下“已经 drain 后又追加 pending”的永久滞留窗口。
+3. 动态内核任务使用 vsched2 的 `push_task()`，由 `Task::is_kernel()` 明确选择 kernel
+   scheduler；不再使用 `push_task_into_current()`，因此即使创建发生在处理用户 TrapInfo
+   期间，也不会误入当前用户进程的 ReadyQueue。
+4. timer tick 已拆分职责：每次硬件 tick 都执行调度器无关的 `timers::check_events()`，只有
+   vsched2 未激活时才执行 AxRunQueue 的 `scheduler_timer_tick()`。这补回 sleep/timeout 的
+   软件 Waker 来源，同时不恢复旧调度器时间片。
+5. closure 自然返回和显式 `axtask::exit()` 统一走 external exit：发布 exit code、设置 AxTask
+   `Exited`、唤醒 joiner、失效旧 Waker generation，再由 vsched2 保存/移交线程栈并调度；
+   不再进入 legacy `EXITED_TASKS`、GC task 或 AxRunQueue reschedule。
+6. `set_priority()` 在 external 模式下更新当前 vsched2 内核任务的 priority，并校验
+   `[HIGHEST_PRIORITY, LOWEST_PRIORITY]`。vsched2 尚无 affinity/migration 接口，因此
+   `set_current_affinity()` 明确失败，syscall 返回 `Unsupported`，不再静默修改无效的 AxTask
+   metadata 或创建 legacy migration task。
+7. 短期仍保留 ArceOS runtime 在进入 StarryOS `main()` 前已经初始化的 AxRunQueue/GC task，
+   但 vsched2 接管后，普通 spawn、yield、block_on Waker、timer scheduler tick、exit、priority
+   和 affinity 均不再把运行时控制交回旧队列。不能把旧队列中的 TCB 批量搬入 vsched2；其
+   中混有不同状态和外部 Waker，运行时搬运会产生重复调度、共享栈或悬空引用。
 
-不能简单遍历 AxRunQueue 并把任务指针塞入 vsched2。队列中混有 Ready、Running、Blocked、
-Exited 和正在切换的任务，其 Waker 还可能挂在 IRQ、timer、WaitQueue、pipe、socket 或
-joiner 上。只搬 TCB 会造成重复调度、永久阻塞、共享栈或悬空引用。
+当前验证：
 
-实施与验收要求：
+- `make build` 通过；
+- `make verify-vsched2` 通过；
+- 验证日志确认 `dev-log-server`、`alarm_task` 和 `tty-reader` 均由 vsched2 接管；
+- Welcome、wait4/block_on continuation 和 handler 池既有回归保持通过，未出现 vDSO panic、
+  非法状态、栈错误或 ReadyQueue 溢出。
 
-1. 审计全部 `spawn/spawn_raw/spawn_with_name`、join/exit 和直接访问 AxRunQueue 的路径；
-2. 新内核任务统一通过 kernel-spawn hook 进入 vsched2；初始化前必须保留的任务进入显式
-   pending 列表，初始化后只入 vsched2 ReadyQueue；
-3. 分别补齐这些任务的 Waker、阻塞、退出、join 和回收协议，不能让同一任务同时属于两个
-   调度器；
-4. 用 vsched2 的等待根、生命周期和多核机制替代旧 scheduler 的 idle/gc/migration 责任；
-5. vsched2 激活后，不得存在“已被唤醒但只在 AxRunQueue 中、因而永远不会运行”的必要任务。
+剩余边界不再属于“误入 AxRunQueue”的单核主路径：
 
-### 5.2 P0-2：逐类验证并修复 `block_on` 调用（次优先）
+- `fb-refresh` 和 `vsock-poll` 已由同一 spawn hook 覆盖，但当前 QEMU 无对应设备，尚未做条件
+  设备运行验证；
+- `kernel task: spawn -> sleep -> wake -> return -> join`、显式 `axtask::exit()` 的专门功能
+  用例仍需加入测试矩阵；实现路径已经统一，本项不再依赖 AxRunQueue；
+- sleep/alarm/timeout 可作为 P0-2 的延迟唤醒测试载体；其原有语义与取消竞争不在本项处理；
+- remote wake/IPI、timer owner、真正的 affinity/migration 归入 P1 多核；
+- `VschedTaskImpl::dealloc()` 和最终内核任务回收仍归入 P1 生命周期。
 
-wait4 和终端 read 的最小 continuation/Waker 闭环已经验证，但这不能证明其它 Future 正确。
-需要依次覆盖 futex、sleep/timer、pipe、文件/磁盘、poll/select/epoll、signal、eventfd、网络、
-WaitQueue 和 mutex：
+### 5.2 P0-2：验证并修复通用 `block_on` × vsched2 适配层（次优先）
 
-- 2026-07-27 已命中 pipe 未完成用例：`echo PIPE_OK | cat` 数据能够输出，但 shell 的
-  pipe EOF/子进程退出/wait4 链不能收敛；需分别记录两个子进程的 FD 引用、exit 状态、对应
-  handler continuation 和 Waker generation，定位是写端未关闭、退出/wait4 关系错误还是
-  唤醒丢失；
-- 注册 Waker 后必须二次检查等待条件，封闭检查与注册之间的丢失唤醒窗口；
-- 正常完成、signal、timeout、取消和资源关闭并发时只能完成及入队一次；
-- continuation 恢复后不能重复已经发生的 I/O 副作用；
-- exit/execve 必须使遗留 Waker 失效，不能唤醒已注销或复用后的任务；
-- 普通内核线程和 TrapHandler 两类 `block_on` 调用者都必须满足状态、栈和 IRQ 协议；
-- 多核 remote wake 必须有正确的内存顺序、目标 CPU 通知和唯一入队保证。
+本项只处理因接入 vsched2 和可复用 TrapHandler 而产生的问题，不再把 StarryOS 原有的
+futex、signal、PollSet、timer、pipe EOF 或文件系统语义缺陷直接归入 P0-2。具体资源 Future
+只作为触发公共适配路径的测试载体；只有能够证明“同一 Future 在原 AxRunQueue 路径正常，
+在 vsched2 适配层发生错误”，或直接观察到 handler 状态、Waker 目标、continuation 栈和
+ReadyQueue 入队错误时，才修改本节代码。
 
-共享 handler 池只解决“一个 syscall 阻塞时其他 handler 仍能处理后续 trap”，不自动证明
-具体资源 Future 或其取消路径正确。每类调用都要有可重复的功能测试、signal/timeout 测试和
-Waker 计数断言。
+当前公共模型保持不变：
+
+```text
+TrapHandler/普通内核任务 poll Future -> Pending
+  -> AxWaker: Idle -> Parking
+  -> 当前 vsched2 任务: Running -> Blocking
+  -> AxWaker: Parking -> Parked
+  -> 协程调用者按需临时转为线程并保存同步 continuation 栈
+  -> vsched2 在上下文安全后提交 Blocking -> Blocked
+  -> Waker 将同一 continuation 所有者改为 Ready 并唯一入队
+  -> 恢复原栈、原执行身份和原 IRQ 状态后继续 poll
+```
+
+2026-07-29 审计确认并已修复以下公共适配问题：
+
+1. **已删除 wait4 的旧双模型。** `TrapTaskWaker`、`WaitPidStep::Pending` 和
+   `SyscallOutcome::Pending` 属于旧的“TrapHandler 提前返回、以后重放 syscall”方案。共享
+   handler 模型下，`vsched2 current` 是 handler、`trapped task` 是用户任务，旧分支正常不会
+   命中；若意外命中还会违反 dispatcher 的 `Complete` 断言。wait4 应恢复为普通同步
+   `sys_waitpid() -> block_on(...)`，由当前 handler 保存 continuation，直到 syscall 真正完成。
+2. **已改为完整发布 block_on 后端后再激活 vsched2。** 不再先写入
+   `VSCHED2_YIELD`，再逐个注册
+   `BLOCK_ON_CURRENT/WAKE/STATE/TOGGLE`；多核观察者可能看到 `vsched2_active()==true`，但后端
+   尚未安装。应先注册全部 hooks，最后用 `VSCHED2_YIELD` 的 Release store 作为发布点，
+   `vsched2_active()` 的 Acquire load 作为获取点。
+3. **Waker 已改为在创建时绑定调度后端。** `AxWaker::wake_by_ref()` 不再在 wake 时重新读取全局
+   `vsched2_active()`。`block_on` 入口只选择一次 Legacy 或 vsched2 owner；vsched2 owner 必须
+   保存真实的当前任务指针和 generation。active 路径缺少 current task 或任一必要 hook 时应
+   fail-fast，不能保存空指针、静默丢 wake，或在缺少 toggle 时把协程误当普通线程。
+
+当前状态机和栈切换暂未发现需要重写的逻辑：wake-before-Parking 由 `Notified` token 促成立即
+repoll；wake 发生在 `Blocking`、上下文尚未保存时只修改为 `Ready`，由保存方完成唯一入队；
+wake 发生在 `Blocked` 后由 Waker 完成 `Ready` 和入队；协程调用者继续使用显式
+coroutine -> thread -> coroutine 往返保存同步调用链。除非专项测试失败，不扩大 vsched2 侧修改。
+
+专项验收分两层：
+
+- 用户态 `tests/vsched2_test` 自动覆盖重复 nanosleep/timer 延迟唤醒和同一
+  continuation 的多次 block_on 往返。BusyBox 前台启动该程序时，父 shell 同时
+  进入 wait4；只有测试进程 sleep 完成、退出且父 handler continuation 被唤醒后，
+  `src/init.sh` 才输出 `VSCHED2_SHELL_WAIT4 single PASS`。该用例同时验证 timer 和单
+  wait4；测试只判断 syscall 是否按时返回，不据此修复资源自身语义；
+- 内核适配层继续覆盖 wake-before-park、wake-during-Blocking、duplicate wake、普通 vsched2
+  内核线程 `spawn -> sleep -> wake -> return -> join`、嵌套 block_on 和 handler 复用后的 stale
+  generation。测试需断言每个等待周期最多一次 ReadyQueue 入队，并记录 task 指针、generation、
+  AxWaker 状态和 TaskState；不在正常构建中保留高频日志。
+
+2026-07-29 运行验证：`vsched2_test` 连续 6 次 `thread::sleep(20ms)` 已通过，测得累计等待约
+172--177ms；父 BusyBox wait4 在 child 退出后恢复。传统 `fork()` child 首次恢复曾因 syscall
+dispatcher 使用只初始化少量寄存器的 `UserContext::new()`、继承到 `gp=0` 而在首个 syscall
+之前访问 `0x194`；现已在 dispatcher 中复制完整 trapped GPR，并由 `fork -> child _exit(0)
+-> parent waitpid()` 回归验证。该问题不是 block_on Waker 错误。对于真实非法用户访问，
+fatal signal 仍缺少 vsched2 返回路径的交付/退出收敛，独立列为 P0-4。
+
+本轮最终验证：`cargo check --release`（`tests/vsched2_test`）、`make build`、
+`make test` 和 `make verify-vsched2` 均通过。默认测试日志包含
+`VSCHED2_TEST timer PASS`、`VSCHED2_SHELL_WAIT4 single PASS` 和 `VSCHED2_INIT_TEST PASS`；
+没有 vDSO panic、block_on 非法状态、ReadyQueue 溢出或默认路径 SIGSEGV。
+
+多核原子状态和唯一入队属于本项设计约束；vDSO `CPU_NUM` 配置、副核启动、等待 hart 的 IPI、
+affinity、timer owner 和任务迁移仍属于 P1。后续 remote wake 在成功 `push_task()` 后补充唤醒
+空闲 hart，不改变本节 block_on 状态机。
 
 ### 5.3 P0-3：打通不进入内核的用户态线程切换
 
@@ -597,6 +710,27 @@ Waker 计数断言。
 当前审计入口集中在 `api/src/syscall/task/schedule.rs`、`api/src/syscall/task/clone.rs`、
 `api/src/task.rs`、`core/src/vsched/task.rs`、`core/src/vsched/context.rs`、
 `core/src/vsched/trap_vector.rs` 和 vsched2 的 `src/main_loop.rs`。
+
+2026-07-29 已修复用户任务 vDSO 基址生命周期：地址空间 clone 同步复制 vDSO 元数据，
+`clear()` 清除映射时同时清零元数据，plain fork 安装私有 child vDSO 后更新任务缓存，execve
+装载新镜像后也在返回用户调度前更新缓存。创建用户 VTI 时对零基址 fail-fast。日志验证
+BusyBox fork、execve 和 `vsched2_test` 自身 fork 的 `aspace_vdso == task_vdso != 0`。这补齐了
+`Context::into_user()` 的必要前置条件，但并不代表 P0-3 的用户态 Task VTABLE、协作上下文、
+同地址空间线程注册或用户运行时入口已经完成。
+
+2026-07-30 已修复 BusyBox 执行 `ls` 时 fork 子进程重映射 vDSO 的
+`AxErrorKind::AlreadyExists` panic。根因是 StarryOS 曾按整个 `.so` 文件长度再加一页计算
+`VDSO_SIZE=0x28000`，并在初始加载、bootstrap 和 clone 中手工补尾部；但生成 loader 实际按
+ELF `PT_LOAD.p_memsz` 映射，当前真实跨度仅为 `0x1e000`。文件尾部的 `.symtab/.strtab` 不属于
+运行时映射，`.bss` 已包含在 `p_memsz` 中。BusyBox 的复杂地址布局只够 loader 请求的
+`vVAR 0x3000 + vDSO 0x1e000 = 0x21000`，随后追加的错误尾部与已有 VMA 重叠。
+
+修复限定在 StarryOS：`vdso` 适配层从对齐后的 ELF `PT_LOAD` 区间计算运行时跨度，
+`MemIf::valloc()` 至少按该完整跨度选址，全局 `VDSO_SIZE` 使用同一结果；同时删除三处人工
+尾部映射。fork 仍先删除 child 继承的旧 vVAR/vDSO，再由 `map_so()` 建立 child 私有的可写及
+重定位页面，没有退回父子共享可写 vDSO。`make build` 通过；BusyBox `ls /`、`mkdir`、重定向、
+`cat` 和管道数据传输正常，`vsched2_test` 的 user-vDSO、timer、fork/waitpid 全部 PASS。
+管道输出后提示符不返回仍按既有“管道退出链”问题独立处理，不属于本次地址冲突。
 
 #### 尚缺的端到端链路
 
@@ -636,20 +770,86 @@ syscall 的 handler 变成无 Waker 的 `Blocked`。用户态 vDSO 入口完成�
 地址空间或全局优先级调度、调度元数据校验失败，以及多核 remote wake/affinity/迁核需要
 内核协调。目标是提供同地址空间的本地快速路径，而不是删除内核调度入口。
 
-#### 建议实现与验收顺序
+#### 分阶段实现与验收顺序
 
-1. 修复 `CLONE_THREAD -> vsched_process_id -> USER_SCHEDULER` 注册闭环；
-2. 设计每进程 `UserSchedTask`/用户调度页和安全句柄，保留独立的 `KernelTask` 生命周期；
-3. 实现 U 模式 Task 操作和 cooperative context；
-4. 实现、导出并接入 `__vdso_sched_yield`，无本地任务时可靠 fallback；
-5. 加入 `vdso_local_switch_count`、`vsched_into_kernel_count`、`sched_yield_ecall_count`，并按
-   cause 细分 trap 计数，避免把异步 timer/IRQ 误算成 yield 主动进入内核；
-6. 用同地址空间线程 A/B 循环 yield 验证：二者属于同一 `USER_SCHEDULER`、页表根不变、
-   本地切换计数增长、`into_kernel` 和 `sched_yield` ecall 计数不增长，且栈、`tp`/TLS 和
-   返回地址正确；测试期间发生的异步中断单独记录，不作为用户切换主动陷入；
-7. 最后验证 signal、退出、无本地 Ready 任务以及多核 remote wake 等回退边界。
+**阶段 A：冻结现状边界和非侵入基线。** 本阶段不启用用户态本地切换，不修改 syscall、
+trap、任务状态或 vsched2 调度逻辑，也不增加参与运行时决策的计数和全局状态。只完成：
 
-### 5.4 P1：多核配置、启动和跨核唤醒
+1. 用户测试通过 `AT_SYSINFO_EHDR` 确认 vDSO 已映射，并只读校验 ELF magic；
+2. 构建回归检查现有 vDSO 导出的 `raw_thread_entry/raw_run_task/raw_trap_entry` 以及
+   Task、Stack、Context、TrapInfo、SMP、VSpace、UserData 的 VTABLE 初始化入口；
+3. 冻结当前边界：这些是 vsched2 已有的通用入口，不等于 StarryOS 已经具有稳定的用户调度
+   ABI；当前 `.so` 没有可供 libc 直接调用的 `__vdso_sched_yield`，用户 Task VTABLE、共享
+   控制块和 cooperative context 也尚未定义；
+4. 当前标准 `sched_yield()` 仍是 ecall 路径。阶段 A 只通过代码审计记录这一事实，不主动
+   调用或改写它，避免把尚未完成的 syscall-yield 适配混入 ABI 基线。
+
+阶段 A 的检查不得改变 BusyBox、wait4/block_on、fork/exec、Hello World 或现有调度行为。
+后续共享结构的 `magic/version/size/alignment` 在结构真正定义的阶段 B 冻结，不能在阶段 A
+预先猜测布局。
+
+2026-07-30 阶段 A 已完成：没有新增 `metrics` 模块，没有修改 StarryOS syscall/trap/任务状态
+或 vsched2。`vsched2_test` 只读确认用户 vDSO 基址非零且 ELF magic 正确，实际输出
+`VSCHED2_TEST user_vdso PASS base=0x7a000`；`make verify-vsched2` 同时确认上述通用入口仍存在，
+并保持 timer、fork/waitpid、BusyBox wait4、init 退出及既有 panic/非法状态检查全部通过。宿主
+已有 QEMU 占用了默认 5555 端口并锁定 `arceos/disk.img`，因此运行验证使用关闭网络的 `/tmp`
+镜像副本；同一内核和用户测试内容正常完成，环境冲突没有通过修改项目配置规避。
+
+**阶段 B：共享 ABI 与线程注册。** 建立内核和用户运行时共用的 `no_std` ABI 定义，修复
+`CLONE_THREAD -> vsched_process_id -> USER_SCHEDULER` 注册闭环，并以 slot + generation
+暴露用户安全句柄，不泄漏 `AxTaskRef` 或内核裸指针。
+
+**阶段 C：用户 VTABLE 与 cooperative context。** 实现只操作用户调度控制块的 Task、Stack、
+Context、SMP 接口，保存和恢复 `ra/sp/gp/tp/s0-s11`，先用独立测试运行时验证栈和 TLS。
+
+**阶段 D：打通 vDSO 本地切换。** 在 vDSO 中提供完整入口，复用 vsched2 的
+`uschedule/utask_schedule` 设计；无本地 Ready 线程或需要内核工作时通过既有
+`Context::into_kernel()` 回退。
+
+**阶段 E：接入 libc 并验证边界。** 让 libc/pthread 的 `sched_yield()` 优先调用稳定的 vDSO
+入口，保留原 syscall fallback；使用同地址空间线程 A/B 验证页表、栈、`tp`/TLS、返回地址和
+主动 ecall 边界。
+
+**阶段 F：单核完整回归与多核扩展。** 先完成 signal、退出、无 Ready 任务、fork/exec 和
+block_on 回归，再补充 per-CPU 当前任务、remote wake/IPI、affinity、迁核及 SMP=2/4 验证。
+
+### 5.4 P0-4：接入用户 trap 返回前的信号交付与退出收敛
+
+本项本质是 **vsched2 与 StarryOS 信号机制的集成问题**，不是 signal pending 队列本身损坏。
+无法修复的页错误已经能把 `SIGSEGV` 放入正确用户进程的 pending 集合，
+`ProcessSignalManager::send_signal()` 也会返回可唤醒 tid；但当前
+`vsched_trap_dispatcher()` 随后只调用 `AxTask::interrupt()` 并返回。`interrupt()` 只设置
+axtask 的 interrupted 标志并唤醒其 Waker，不会消费 pending signal、执行默认动作或修改
+用户 trap frame。
+
+受控非法写验证始终观察到同一 task、同一 `sepc`、同一 `stval` 和正确页表根；从第二次起
+`SIGSEGV pending_before=true`，同时持续为 `wake_tid=Some(...)`、`pending_exit=false`。因此
+`raise_signal_fatal_for_task()` 的直接 `do_exit()` fallback 不会命中，handler 返回后 vsched2
+又恢复原 faulting frame，形成：
+
+```text
+用户故障 -> SIGSEGV pending -> AxTask::interrupt()
+         -> TrapHandler 返回 -> 原 sepc 恢复 -> 同一用户故障
+```
+
+修复必须复用普通 StarryOS 用户循环的信号语义，不能把所有 SIGSEGV 简化成无条件
+`do_exit()`，否则会破坏用户自定义 signal handler：
+
+1. 抽取“返回用户态前交付 pending signal”的公共函数，普通用户循环和 vsched2 dispatcher
+   使用同一语义，包括 `unblock_next_signal()` 与 `check_signals()`；
+2. 始终以真正被 trap 的用户任务为 signal owner，不能把可复用 TrapHandler 当作进程线程；
+3. signal handler 修改了 `sepc/sp` 或 signal frame 时，把完整 `UserContext` 写回稳定
+   `UserTrapFrame`，不能只写 `a0/a1`；
+4. 默认 Terminate/CoreDump/Stop 动作调用 `do_exit()` 后，TrapInfo 完成路径必须保留 `Exited`，
+   禁止重新入 ReadyQueue 或恢复 faulting frame；
+5. 保持 block/ignore、用户 handler、`sigreturn`、syscall restart 和 group-exit 的原有语义，
+   并明确多线程进程中被选中 tid 与实际 trapped task 的关系。
+
+验收用例至少包括：未安装 handler 的 SIGSEGV 只退出一次且 parent wait4 收敛；安装用户
+SIGSEGV handler 后能进入 handler；被阻塞/忽略 signal 遵循既有策略；fatal signal 不重复刷屏；
+正常 syscall、page fault 按需填页、timer/block_on 和 fork 回归不倒退。
+
+### 5.5 P1：多核配置、启动和跨核唤醒
 
 2026-07-27 在最新 vsched2 `main` 上复测：`make SMP=4 build` 成功，OpenSBI 和 StarryOS 均
 识别 4 个 hart，但 vsched2 vDSO 的 `CPU_NUM` 仍为 1，hart 1/2/3 访问 `CURRENT_TASK` 等数组
@@ -661,7 +861,7 @@ StarryOS、vsched2 `.so`、`libvsched2` wrapper 及所有 per-CPU 数组使用�
 secondary bootstrap、per-hart `stvec/sscratch/gp`、current/trap stack、timer owner、IPI、
 remote wake、WFI、affinity、任务迁移、共享 handler 池和 AxWaker 唯一入队。
 
-### 5.5 P1：任务、handler、栈和 process slot 生命周期
+### 5.6 P1：任务、handler、栈和 process slot 生命周期
 
 - 普通进程需在 TrapInfo 完成且确认不会再次入队后 deferred 回收 task、稳定 frame、
   vsched2 process slot、旧 vDSO 和地址空间引用；不能在 `sys_exit` 内过早
@@ -674,7 +874,7 @@ remote wake、WFI、affinity、任务迁移、共享 handler 池和 AxWaker 唯�
   IRQ、主动 yield、跨核恢复和最终回收的所有权；
 - `VSpace::dealloc()` 当前采用借用式所有权而为 no-op；若改为拥有式句柄必须成对释放。
 
-### 5.6 P2：调度语义和系统调用兼容性
+### 5.7 P2：调度语义和系统调用兼容性
 
 - 同优先级进程当前偏向 current process，不是公平轮转；后续使用 per-CPU cursor，只在当前
   最高优先级集合内轮转，并定义进程注销、优先级变化和多核同步语义；
@@ -686,7 +886,7 @@ remote wake、WFI、affinity、任务迁移、共享 handler 池和 AxWaker 唯�
 - `UserData::get_user_data()` 仍兼容上游把 small pid 当作 vspace 参数的实际行为，应在接口
   语义稳定后移除这种双义兼容。
 
-### 5.7 P3：长期演进与文档清理
+### 5.8 P3：长期演进与文档清理
 
 - 将逐类 syscall/Future 迁移为 vsched2 可见的协程执行流；同步 syscall 仍保持一次激活快速
   完成，最终再评估 io_uring 式异步系统调用提交/完成队列；
@@ -699,15 +899,20 @@ remote wake、WFI、affinity、任务迁移、共享 handler 池和 AxWaker 唯�
 
 | 范围 | 命令/方式 | 当前状态 |
 |---|---|---|
-| 最新 vsched2 编译/ABI | `make build`、`make verify-vsched2` | ✅ `5738b48` 通过 |
+| 最新 vsched2 编译/ABI | `make build`、`make verify-vsched2` | ✅ 本轮在当前 vsched2 working tree 通过 |
 | 单核启动与 wait4 接力 | `make verify-vsched2` | ✅ 通过 |
 | Welcome/Hello 里程碑 | 交互 shell 直接执行 `hello_world` | ✅ 均正常输出 |
 | init `exit`/系统关机 | shell `exit` + 父 init wait4 | ✅ QEMU 正常关闭 |
 | BusyBox prompt/UART 输入 | 交互版 `src/init.sh` + `make test` | ✅ 多轮输入，无栈 panic |
 | 基础命令/文件 I/O | `echo`、`pwd`、相对 `mkdir`、重定向、`cat` | ✅ 已通过最小回归 |
 | 绝对路径 `mkdir -p` | `mkdir -p /tmp/vsched-regression` | ❌ 根目录分量返回 `EINVAL` |
-| 管道退出链 | `echo PIPE_OK \| cat` | ❌ 数据输出后 shell 不返回 |
-| timer/sleep/timeout | 分类测试 | ⏳ 中断恢复后验证 |
+| 管道退出链 | `echo PIPE_OK \| cat` | ❌ 数据输出后 shell 不返回；尚未证明属于 block_on 适配层 |
+| timer event 来源 | `on_timer_tick` ownership 审计 | ✅ 始终 `check_events`，只跳过 AxRunQueue tick |
+| block_on × vsched2 公共适配 | `vsched2_test` + BusyBox wait4 + handler/内核任务专项 | ⚠️ timer、单 wait4 和 fork/waitpid 通过；内核竞态专项待补 |
+| 传统 `fork()` child 恢复 | Rust FFI `fork` 后 child `_exit(0)`、parent `waitpid()` | ✅ dispatcher 复制完整 GPR，child `gp` 与退出链正确 |
+| fork/exec vDSO 基址同步 | clone、exec 日志对照 `AddrSpace` 与 `VschedTaskImpl` | ✅ 两者非零且相等；clone/clear 元数据生命周期已补齐 |
+| fork 子进程 vDSO 私有重映射 | BusyBox `ls /` + `vsched2_test` fork/waitpid | ✅ PT_LOAD 运行时跨度统一为 `0x1e000`，不再追加文件尾部保留区 |
+| fatal 用户 signal 收敛 | 故意 SIGSEGV + 默认动作/用户 handler | ❌ pending 可入队但未在 vsched2 返回路径交付；P0-4 |
 | 同地址空间 U 模式切换 | 双线程 vDSO yield + 原因分类计数 | ❌ 未打通：仍经 ecall，线程注册和 U 模式上下文尚缺 |
 | 双核 | `SMP=2 make test` | ⏳ 阶段 4 |
 | 四核静态构建 | `make build SMP=4` | ✅ 通过 |
@@ -717,10 +922,16 @@ remote wake、WFI、affinity、任务迁移、共享 handler 池和 AxWaker 唯�
 
 ```text
 Welcome to Starry OS!
-[wait4] BLOCK children=...
+[vsched2] kernel task accepted: name=dev-log-server ...
+[vsched2] kernel task accepted: name=alarm_task ...
+[vsched2] kernel task accepted: name=tty-reader ...
+sys_waitpid <= pid: ...
 [block_on] coroutine -> thread task=...
 trap handler pool grow: handler=..., cpu=...
 [block_on] thread -> coroutine task=...
+VSCHED2_TEST timer PASS
+VSCHED2_SHELL_WAIT4 single PASS
+VSCHED2_INIT_TEST PASS
 vsched2 log verification passed
 ```
 
@@ -751,8 +962,15 @@ vsched2 log verification passed
 | 普通内核线程的 vsched Stack 与 AxTask 实际栈不一致 | ⚠️ 已按所有权 token 脱离；多核前仍需审计 IRQ 和回收语义 |
 | 内核根协程 poll 的 IRQ 状态丢失 | ✅ 每协程 `IrqCorotineWrapper` |
 | 根协程被 IRQ 打断后 continuation 无法恢复 | ✅ 临时线程 + `sret` + 恢复协程身份 |
+| 后台任务和通用 spawn 仍进入 AxRunQueue | ✅ external spawn hook；启动 pending 与动态内核任务统一进入 vsched2 |
+| timer Future 事件随 AxRunQueue tick 一起跳过 | ✅ 始终检查 timer event，仅旧 scheduler tick 被禁用 |
+| 内核任务自然返回/显式 exit 进入旧调度器 | ✅ external exit 发布 exit/join 后由 vsched2 调度 |
+| priority/affinity 回落 AxRunQueue | ✅ priority 映射；affinity 未实现时明确失败 |
 | `config.log=true` 仍需改 vsched2 | ✅ template 自动日志桥 |
 | vDSO panic 无输出 | ✅ template panic 日志 |
 | `make test` 复制整个 target 导致 ENOSPC | ✅ 只复制 release 顶层程序 |
+| fork/exec 后 `user_vdso_base == 0` | ✅ clone/clear 元数据与 task 缓存同步，创建期非零校验 |
+| BusyBox `ls` fork 时扩展 vDSO 返回 `AlreadyExists` | ✅ StarryOS 按 ELF PT_LOAD/p_memsz 统一运行时跨度，删除三处人工尾部映射 |
+| fatal SIGSEGV 重复恢复同一 `sepc` | ❌ P0-4：pending 已入队，vsched2 返回路径尚未交付/退出收敛 |
 | `Welcome to Starry OS!` | ✅ 当前自动验证通过 |
 | `Hello, World!` | ✅ 旧 init 脚本已通过 |

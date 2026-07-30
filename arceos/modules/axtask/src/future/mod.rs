@@ -1,9 +1,6 @@
 //! Future support.
 
-use alloc::{
-    sync::Arc,
-    task::Wake,
-};
+use alloc::{sync::Arc, task::Wake};
 use core::{
     fmt,
     future::poll_fn,
@@ -15,6 +12,7 @@ use core::{
 use axerrno::AxError;
 use kernel_guard::NoPreemptIrqSave;
 use kspin::SpinNoIrq;
+
 use crate::{AxTaskRef, WeakAxTaskRef, current, current_run_queue, select_run_queue};
 
 mod poll;
@@ -26,17 +24,29 @@ pub use time::*;
 struct AxWaker {
     task: WeakAxTaskRef,
     woke: SpinNoIrq<bool>,
+    /// Scheduler ownership is captured when `block_on` starts.  A Waker must
+    /// not re-read the global activation flag later: the scheduler may be
+    /// published between Future registration and wakeup.
+    owner: BlockOnOwner,
     /// Cross-CPU handoff between the polling task and its Waker.
     ///
     /// A Waker may only touch the vsched2 task state after this value reaches
     /// PARKED.  Before that point it leaves a NOTIFIED token, which makes the
     /// polling CPU cancel Blocking and repoll instead of losing the wake.
     vsched_wait: AtomicU8,
+}
+
+#[derive(Clone, Copy)]
+enum BlockOnOwner {
+    Legacy,
     /// The vsched2 task that owns the suspended continuation.  This is not
-    /// necessarily the axtask task stored in `task`: a reusable TrapHandler
-    /// executes with the trapped user task as its temporary axtask identity.
-    vsched_task: *const (),
-    vsched_generation: usize,
+    /// necessarily the axtask task stored in `AxWaker::task`: a reusable
+    /// TrapHandler executes with the trapped user task as its temporary
+    /// axtask identity.
+    Vsched2 {
+        task: *const (),
+        generation: usize,
+    },
 }
 
 const WAIT_IDLE: u8 = 0;
@@ -48,15 +58,12 @@ unsafe impl Send for AxWaker {}
 unsafe impl Sync for AxWaker {}
 
 impl AxWaker {
-    fn new(task: &AxTaskRef) -> Arc<Self> {
-        let (vsched_task, vsched_generation) = crate::api::block_on_current_task()
-            .unwrap_or((core::ptr::null(), 0));
+    fn new(task: &AxTaskRef, owner: BlockOnOwner) -> Arc<Self> {
         Arc::new(AxWaker {
             task: Arc::downgrade(task),
             woke: SpinNoIrq::new(false),
+            owner,
             vsched_wait: AtomicU8::new(WAIT_IDLE),
-            vsched_task,
-            vsched_generation,
         })
     }
 
@@ -126,12 +133,7 @@ impl AxWaker {
 
     fn abort_park(&self) {
         self.vsched_wait
-            .compare_exchange(
-                WAIT_PARKING,
-                WAIT_IDLE,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
+            .compare_exchange(WAIT_PARKING, WAIT_IDLE, Ordering::AcqRel, Ordering::Acquire)
             .expect("block_on: invalid aborted wait state");
     }
 
@@ -160,12 +162,7 @@ impl AxWaker {
             };
             if self
                 .vsched_wait
-                .compare_exchange_weak(
-                    state,
-                    new_state,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
+                .compare_exchange_weak(state, new_state, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
                 return wake_task;
@@ -181,19 +178,23 @@ impl Wake for AxWaker {
 
     fn wake_by_ref(self: &Arc<Self>) {
         *self.woke.lock() = true;
-        if crate::api::vsched2_active() && !self.vsched_task.is_null() {
-            if self.notify() {
-                // PARKED guarantees that the polling CPU has already committed
-                // task state to Blocking.  The wake callback can therefore use
-                // the existing Blocking/Blocked -> Ready protocol on any CPU.
-                let _ = crate::api::wake_block_on_task(
-                    self.vsched_task,
-                    self.vsched_generation,
-                );
+        match self.owner {
+            BlockOnOwner::Vsched2 { task, generation } => {
+                if self.notify() {
+                    // PARKED guarantees that the polling CPU has already
+                    // committed task state to Blocking.  The wake callback can
+                    // therefore use the existing Blocking/Blocked -> Ready
+                    // protocol on any CPU.
+                    let _ = crate::api::wake_block_on_task(task, generation);
+                }
             }
-        } else if let Some(task) = self.task.upgrade() {
-            if !crate::api::vsched2_active() {
-                select_run_queue::<NoPreemptIrqSave>(&task).unblock_task(task, false);
+            BlockOnOwner::Legacy => {
+                if let Some(task) = self.task.upgrade() {
+                    // This Waker was created for an AxRunQueue-owned task.  Its
+                    // ownership must not change if vsched2 is published before
+                    // the wakeup arrives.
+                    select_run_queue::<NoPreemptIrqSave>(&task).unblock_task(task, false);
+                }
             }
         }
     }
@@ -206,10 +207,23 @@ impl Wake for AxWaker {
 pub fn block_on<F: IntoFuture>(f: F) -> F::Output {
     let mut fut = pin!(f.into_future());
 
-    if crate::api::vsched2_active() {
+    let use_vsched2 = crate::api::vsched2_active();
+    if use_vsched2 {
+        assert!(
+            crate::api::block_on_hooks_ready(),
+            "block_on: vsched2 is active before all block_on hooks are registered"
+        );
         let curr = current();
         let task = curr.clone();
-        let axwaker = AxWaker::new(&task);
+        let (vsched_task, generation) = crate::api::block_on_current_task()
+            .expect("block_on: vsched2 caller has no current scheduler task");
+        let axwaker = AxWaker::new(
+            &task,
+            BlockOnOwner::Vsched2 {
+                task: vsched_task,
+                generation,
+            },
+        );
         let waker = Waker::from(axwaker.clone());
         let mut cx = Context::from_waker(&waker);
         loop {
@@ -242,18 +256,12 @@ pub fn block_on<F: IntoFuture>(f: F) -> F::Output {
                         continue;
                     }
 
-                    let toggle = crate::api::BLOCK_ON_TOGGLE
-                        .load(core::sync::atomic::Ordering::Acquire);
-                    let promoted = if toggle != 0 {
-                        let f: fn(bool) -> bool = unsafe { core::mem::transmute(toggle) };
-                        f(true)
-                    } else {
-                        false
-                    };
+                    let promoted = crate::api::toggle_block_on_task(true)
+                        .expect("block_on: vsched2 toggle hook is not registered");
                     crate::yield_now();
                     if promoted {
-                        let f: fn(bool) -> bool = unsafe { core::mem::transmute(toggle) };
-                        let restored = f(false);
+                        let restored = crate::api::toggle_block_on_task(false)
+                            .expect("block_on: vsched2 toggle hook disappeared");
                         debug_assert!(restored, "block_on: failed to restore coroutine context");
                     }
                     axwaker.finish_park();
@@ -267,7 +275,7 @@ pub fn block_on<F: IntoFuture>(f: F) -> F::Output {
     // Original AxRunQueue path (when vsched2 is not active):
     let curr = current();
     let task = curr.clone();
-    let axwaker = AxWaker::new(&task);
+    let axwaker = AxWaker::new(&task, BlockOnOwner::Legacy);
     let waker = Waker::from(axwaker.clone());
     let mut cx = Context::from_waker(&waker);
 

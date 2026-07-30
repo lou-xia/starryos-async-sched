@@ -120,7 +120,9 @@ pub fn sys_sched_setaffinity(
     }
 
     // TODO: support other threads
-    axtask::set_current_affinity(cpu_mask);
+    if !axtask::set_current_affinity(cpu_mask) {
+        return Err(AxError::Unsupported);
+    }
 
     Ok(0)
 }

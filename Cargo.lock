@@ -2602,8 +2602,10 @@ dependencies = [
  "axsync",
  "build_vdso",
  "crate_interface 0.2.0",
+ "include_bytes_aligned",
  "libvsched2",
  "memory_addr 0.4.1",
+ "xmas-elf",
 ]
 
 [[package]]

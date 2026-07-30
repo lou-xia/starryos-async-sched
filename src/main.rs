@@ -56,7 +56,7 @@ fn create_vsched_init_task(args: &[String], envs: &[String]) -> (*const starry_c
     let (entry_vaddr, ustack_top) = load_user_app(&mut uspace, None, args, envs)
         .unwrap_or_else(|e| panic!("Failed to load user app: {}", e));
     let init_vdso_base = uspace.vdso_base;
-    axlog::ax_println!("create_vsched_init_task: entry={:#x}, ustack_top={:#x}", entry_vaddr.as_usize(), ustack_top.as_usize());
+    axlog::info!("create_vsched_init_task: entry={:#x}, ustack_top={:#x}", entry_vaddr.as_usize(), ustack_top.as_usize());
 
     let uctx = UserContext::new(entry_vaddr.into(), ustack_top, 0);
 

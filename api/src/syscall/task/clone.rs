@@ -5,9 +5,6 @@ use axerrno::{AxError, AxResult};
 use axfs::FS_CONTEXT;
 use axhal::uspace::UserContext;
 use axtask::{AxTaskExt, current, spawn_task, vsched2_active};
-use axalloc::{global_allocator, UsageKind};
-use axhal::{paging::MappingFlags, mem::virt_to_phys};
-use memory_addr::{PAGE_SIZE_4K, VirtAddr};
 use bitflags::bitflags;
 use kspin::SpinNoIrq;
 use linux_raw_sys::general::*;
@@ -98,7 +95,14 @@ pub fn sys_clone(
     tls: usize,
     #[cfg(not(any(target_arch = "x86_64", target_arch = "loongarch64")))] child_tid: usize,
 ) -> AxResult<isize> {
-    axlog::ax_println!("[clone] ENTRY flags={:#x} stack={:#x} ptid={:#x} ctid={:#x} tls={:#x}", flags, stack, parent_tid, child_tid, tls);
+    axlog::info!(
+        "[clone] ENTRY flags={:#x} stack={:#x} ptid={:#x} ctid={:#x} tls={:#x}",
+        flags,
+        stack,
+        parent_tid,
+        child_tid,
+        tls
+    );
     const FLAG_MASK: u32 = 0xff;
     let exit_signal = flags & FLAG_MASK;
     let mut flags = CloneFlags::from_bits_truncate(flags & !FLAG_MASK);
@@ -232,7 +236,9 @@ pub fn sys_clone(
         let (task, vti_ptr) = crate::task::new_vsched_user_task(new_task, &new_uctx);
 
         if !flags.contains(CloneFlags::THREAD) {
-            let thr = task.try_as_thread().expect("vsched2 child must have thread");
+            let thr = task
+                .try_as_thread()
+                .expect("vsched2 child must have thread");
             let saved_root = axhal::asm::read_user_page_table();
             let (child_root, vspace): (_, *mut ()) = {
                 let guard = thr.proc_data.aspace.lock();
@@ -251,9 +257,11 @@ pub fn sys_clone(
                 let (user_vdso_base, vvar_size, vdso_size) = {
                     let guard = thr.proc_data.aspace.lock();
                     let base = guard.vdso_base;
-                    (base,
-                     unsafe { starry_core::vsched::VSCHED2_VVAR_SIZE },
-                     unsafe { starry_core::vsched::VSCHED2_VDSO_SIZE })
+                    (
+                        base,
+                        unsafe { starry_core::vsched::VSCHED2_VVAR_SIZE },
+                        unsafe { starry_core::vsched::VSCHED2_VDSO_SIZE },
+                    )
                 };
                 let vvar_start = user_vdso_base - vvar_size;
                 let vdso_end = user_vdso_base + vdso_size;
@@ -277,44 +285,45 @@ pub fn sys_clone(
                 }
 
                 let new_vdso = starry_core::vsched::map_vdso_for_child(vspace);
-                {
-                    let mut guard = thr.proc_data.aspace.lock();
-                    guard.vdso_base = new_vdso as usize;
-
-                    let vdso_size = unsafe { starry_core::vsched::VSCHED2_VDSO_SIZE };
-                    let vdso_end_va = (new_vdso as usize) + vdso_size;
-                    if let Some(highest) = guard
-                        .areas()
-                        .filter(|a| a.start().as_usize() >= new_vdso as usize
-                                && a.end().as_usize() <= vdso_end_va)
-                        .map(|a| a.end().as_usize())
-                        .max()
-                    {
-                        if highest < vdso_end_va {
-                            let gap = vdso_end_va - highest;
-                            let kva = global_allocator()
-                                .alloc_pages(gap / PAGE_SIZE_4K, PAGE_SIZE_4K, UsageKind::VirtMem)
-                                .expect("clone: extend vdso pages failed");
-                            unsafe { core::ptr::write_bytes(kva as *mut u8, 0u8, gap) };
-                            guard
-                                .map_linear(
-                                    VirtAddr::from(highest),
-                                    virt_to_phys(VirtAddr::from(kva as usize)),
-                                    gap,
-                                    MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER,
-                                )
-                                .expect("clone: extend vdso map_linear failed");
-                        }
-                    }
-                }
+                thr.proc_data.aspace.lock().vdso_base = new_vdso as usize;
             }
 
+            let vti_ref = unsafe { &*(vti_ptr as *const starry_core::vsched::VschedTaskImpl) };
+            let aspace_vdso_base = thr.proc_data.aspace.lock().vdso_base;
+            assert_ne!(
+                aspace_vdso_base, 0,
+                "clone: child vDSO remapping produced a zero base"
+            );
+            // new_vsched_user_task() runs before a private fork child remaps
+            // its vDSO.  Publish the final address before the child becomes
+            // runnable so Context::into_user() uses the child mapping.
+            vti_ref
+                .user_vdso_base
+                .store(aspace_vdso_base, Ordering::Release);
+
             let child_pid = starry_core::vsched::process_init(vspace);
-            unsafe { &*(vti_ptr as *const starry_core::vsched::VschedTaskImpl) }
-                .pid.store(child_pid, Ordering::Release);
+            vti_ref.pid.store(child_pid, Ordering::Release);
             starry_core::vsched::user_init_with_vspace(vspace);
+            axlog::info!(
+                "[vsched2-diag] clone child parent_task={} child_task={:#x} vspace={:#x} saved_root={:#x} child_root={:#x} current_root={:#x} aspace_vdso={:#x} task_vdso={:#x} tf={:#x} sepc={:#x} sp={:#x} gp={:#x} tp={:#x} a0={:#x} sstatus={:#x}",
+                curr.id().as_u64(),
+                vti_ptr as usize,
+                vspace as usize,
+                saved_root.as_usize(),
+                child_root.as_usize(),
+                axhal::asm::read_user_page_table().as_usize(),
+                aspace_vdso_base,
+                vti_ref.user_vdso_base.load(Ordering::Acquire),
+                vti_ref.trap_frame.load(Ordering::Acquire),
+                new_uctx.ip(),
+                new_uctx.sp(),
+                new_uctx.regs.gp,
+                new_uctx.regs.tp,
+                0usize,
+                new_uctx.sstatus.bits(),
+            );
             let pushed = starry_core::vsched::push_task_into_process(vti_ptr, child_pid);
-            axlog::ax_println!("[clone] push_task pid={}, ok={}", child_pid, pushed);
+            axlog::info!("[clone] push_task pid={}, ok={}", child_pid, pushed);
         }
 
         add_task_to_table(&task);

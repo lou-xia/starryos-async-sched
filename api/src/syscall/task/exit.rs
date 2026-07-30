@@ -21,6 +21,8 @@ fn mark_exited() {
     }
     let task = starry_core::vsched::trapped_vsched_task();
     if !task.is_null() {
-        unsafe { starry_core::vsched::set_vsched_task_exited(task); }
+        unsafe {
+            starry_core::vsched::set_vsched_task_exited(task);
+        }
     }
 }
