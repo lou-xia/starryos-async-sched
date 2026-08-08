@@ -17,6 +17,7 @@ use super::{
     to_vsched_state,
     trapframe::{UserGeneralRegs, UserTrapFrame, UserTrapFrameKind},
 };
+use crate::task::AsThread;
 
 /// 协程轮询接口。实现该 trait 的任务被 vsched2 作为协程调度。
 pub trait CoroutinePoll: Send + Sync {
@@ -347,7 +348,47 @@ impl libvsched2::Task for VschedTaskImpl {
     }
 
     fn dealloc(&self) {
-        // 用户任务由 ProcessData Arc 管理生命周期，内核任务暂不回收
+        assert_eq!(
+            to_vsched_state(self.task.state()),
+            libvsched2::TaskState::Exited,
+            "dealloc requires an exited task",
+        );
+        assert!(
+            !self.has_execution_task(),
+            "cannot deallocate a task with an active execution owner",
+        );
+        assert_eq!(
+            self.trap_owner.load(Ordering::Acquire),
+            0,
+            "cannot deallocate a task still bound to a trap owner",
+        );
+
+        self.wake_generation.fetch_add(1, Ordering::AcqRel);
+
+        let trap_frame = self.trap_frame.swap(0, Ordering::AcqRel);
+        if trap_frame != 0 {
+            unsafe { drop(Box::from_raw(trap_frame as *mut UserTrapFrame)) };
+        }
+
+        let thread_stack = self.thread_stack_ptr.swap(0, Ordering::AcqRel);
+        if thread_stack != 0 {
+            unsafe { (&mut *(thread_stack as *mut VschedStackImpl)).dealloc() };
+        }
+
+        // A process slot stores a borrowed AddrSpace pointer.  Remove the slot
+        // before dropping the last Thread/ProcessData owner of that address space.
+        if !self.is_kernel.load(Ordering::Acquire)
+            && let Some(thread) = self.task.try_as_thread()
+            && thread.proc_data.proc.threads().is_empty()
+        {
+            let pid = self.pid.load(Ordering::Acquire);
+            if pid != 0 {
+                super::process_drop(pid);
+            }
+        }
+
+        let ptr = self as *const Self as *mut Self;
+        unsafe { drop(Box::from_raw(ptr)) };
     }
 }
 
