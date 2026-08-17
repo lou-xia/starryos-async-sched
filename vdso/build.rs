@@ -14,8 +14,7 @@ fn main() {
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=/home/lou-xia/lou-xia/vsched/vsched2");
-    println!("cargo:rerun-if-changed=/home/lou-xia/lou-xia/StarryOS/vqueue");
-    println!("cargo:rerun-if-changed=/home/lou-xia/lou-xia/StarryOS/vqueue_vdso/src");
+    println!("cargo:rerun-if-changed=../starry_vsched_vdso/src");
     println!("cargo:rerun-if-changed=../build_vdso");
 
     let mut config = BuildConfig::new("/home/lou-xia/lou-xia/vsched/vsched2", "vsched2");
@@ -28,11 +27,12 @@ fn main() {
     config.log = true;
     build_vdso(&config);
 
-    let mut config = BuildConfig::new("/home/lou-xia/lou-xia/StarryOS/vqueue_vdso", "vqueue");
-    config.so_name = String::from("libvqueue");
-    config.api_lib_name = String::from("libvqueue");
-    config.out_dir = String::from("../vdso_vqueue_output");
+    let mut config = BuildConfig::new("/home/lou-xia/lou-xia/StarryOS/StarryOS/starry_vsched_vdso", "starry_vsched_vdso");
+    config.so_name = String::from("libstarry_vsched");
+    config.api_lib_name = String::from("libstarry_vsched");
+    config.out_dir = String::from("../vdso_starry_vsched_output");
     config.toolchain = String::from("nightly-2025-12-12");
     config.verbose = 2;
+    config.log = true;
     build_vdso(&config);
 }

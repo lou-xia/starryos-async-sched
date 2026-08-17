@@ -1,0 +1,8 @@
+[package]
+name = "starry_vsched_vdso"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+vdso_helper = { path = "../../vdso_crate_template/vdso_crate_template/vdso_helper", features = ["log"] }
+vsched-abi = { path = "../vsched_abi" }

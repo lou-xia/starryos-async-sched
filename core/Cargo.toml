@@ -14,7 +14,7 @@ axerrno.workspace = true
 axfeat.workspace = true
 axfs-ng-vfs.workspace = true
 axfs.workspace = true
-axhal.workspace = true
+axhal = { workspace = true, features = ["ipi"] }
 axio.workspace = true
 axlog.workspace = true
 axmm.workspace = true
@@ -51,9 +51,9 @@ xmas-elf = "0.9"
 
 #asynctask.workspace = true
 vdso.workspace = true
+vsched-abi.workspace = true
 
 libvsched2 = { path = "../vdso_vsched2_output/libvsched2" }
-libvqueue = { path = "../vdso_vqueue_output/libvqueue" }
 
 [target.'cfg(not(any(target_arch = "aarch64", target_arch = "loongarch64")))'.dependencies]
 axmm = { workspace = true, features = ["copy"] }

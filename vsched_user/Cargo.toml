@@ -1,0 +1,10 @@
+[package]
+name = "vsched-user"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libstarry_vsched = { path = "../vdso_starry_vsched_output/libstarry_vsched" }
+libvsched2 = { path = "../vdso_vsched2_output/libvsched2" }
+vsched-abi.workspace = true

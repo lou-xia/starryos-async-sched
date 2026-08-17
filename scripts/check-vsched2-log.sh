@@ -11,8 +11,8 @@ if [[ ! -f "$VDSO_SO" ]]; then
     exit 1
 fi
 
-# Stage A only verifies the generic entries already provided by vsched2.  It
-# does not install userspace VTABLEs or change the scheduler's runtime path.
+# 符号检查验证 vsched2 已经提供的通用入口。阶段 C 只安装用户态 Task VTABLE，
+# Stack、Context、SMP 以及真实用户态调度仍留在阶段 D。
 DYNAMIC_SYMBOLS=$(readelf --dyn-syms --wide "$VDSO_SO")
 for symbol in \
     raw_thread_entry raw_run_task raw_trap_entry \
@@ -78,10 +78,14 @@ reject_log "VSCHED2_INIT_TEST FAIL"
 # complete user-space integration result as well.
 if rg -a -F -q "VSCHED2_TEST START" "$LOG_FILE"; then
     require_log "VSCHED2_TEST user_vdso PASS"
+    require_log "VSCHED2_TEST user_task_vtable PASS"
     require_log "VSCHED2_TEST timer PASS"
+    require_log "VSCHED2_TEST clone_thread PASS"
+    require_log "VSCHED2_TEST FORK PASS"
     require_log "VSCHED2_TEST PASS"
-    require_log "VSCHED2_SHELL_WAIT4 single PASS"
-    require_log "VSCHED2_INIT_TEST PASS"
+    # 当前交互式 init 脚本只会在前台测试进程退出后启动登录 shell。因此，观察到提示符也能证明
+    # 父 shell 的 wait4 continuation 已经恢复。
+    require_log "starry:~#"
 fi
 
 echo "vsched2 log verification passed"

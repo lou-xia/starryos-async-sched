@@ -16,14 +16,27 @@ mod trap_vector;
 pub mod trapframe;
 mod userdata;
 
-pub use task::{CoroutinePoll, VschedTaskImpl, register_task, task_from_raw};
+pub use task::{
+    CoroutinePoll, TaskImpl, VschedTaskImpl, direct_task, register_task, register_user_task,
+    task_for_user_key, task_from_raw, unregister_user_task, with_current_vsched_task,
+    with_registered_user_task, with_vsched_task,
+};
+pub use vsched_abi::{
+    SHARED_TASK_SLOT_COUNT, SharedTaskTable, UserTaskKey, VSCHED_INVALID_PROCESS_ID,
+    VschedProcessId,
+};
 
 use crate::config;
+use crate::task::AsThread;
 
 pub static mut VSCHED2_VVAR_START_PA: usize = 0;
 pub static mut VSCHED2_VVAR_SIZE: usize = 0;
 pub static mut VSCHED2_VDSO_START_PA: usize = 0;
 pub static mut VSCHED2_VDSO_SIZE: usize = 0;
+pub static mut STARRY_VDSO_START_PA: usize = 0;
+pub static mut STARRY_VDSO_SIZE: usize = 0;
+pub static mut STARRY_VVAR_START_PA: usize = 0;
+pub static mut STARRY_VVAR_SIZE: usize = 0;
 
 static VSCHED2_READY: AtomicBool = AtomicBool::new(false);
 /// `starry_api::init()` may create background kernel threads before the
@@ -101,9 +114,13 @@ pub fn init_vsched2_interfaces() {
         VSCHED2_VVAR_SIZE = vdso::VVAR_SIZE;
         VSCHED2_VDSO_START_PA = vdso::VDSO_START_PA;
         VSCHED2_VDSO_SIZE = vdso::VDSO_SIZE;
+        STARRY_VVAR_START_PA = vdso::STARRY_VVAR_START_PA;
+        STARRY_VVAR_SIZE = vdso::STARRY_VVAR_SIZE;
+        STARRY_VDSO_START_PA = vdso::STARRY_VDSO_START_PA;
+        STARRY_VDSO_SIZE = vdso::STARRY_VDSO_SIZE;
     }
 
-    libvsched2::init_vtable_Task::<VschedTaskImpl>();
+    libvsched2::init_vtable_Task::<TaskImpl>();
     libvsched2::init_vtable_Stack::<stack::VschedStackImpl>();
     libvsched2::init_vtable_Context::<context::VschedContextImpl>();
     libvsched2::init_vtable_TrapInfo::<trap::VschedTrapInfoImpl>();
@@ -163,16 +180,14 @@ fn set_external_task_priority(priority: isize) -> bool {
     if !(HIGHEST_PRIORITY..=LOWEST_PRIORITY).contains(&priority) {
         return false;
     }
-    let current = current_task_ptr() as *const task::VschedTaskImpl;
-    if current.is_null() {
-        return false;
-    }
-    let current = unsafe { &*current };
-    if !current.is_kernel.load(Ordering::Acquire) {
-        return false;
-    }
-    current.priority.store(priority, Ordering::Release);
-    true
+    with_current_vsched_task(|current| {
+        if !current.is_kernel.load(Ordering::Acquire) {
+            return false;
+        }
+        current.priority.store(priority, Ordering::Release);
+        true
+    })
+    .unwrap_or(false)
 }
 
 fn reject_external_task_affinity(_cpumask: axtask::AxCpuMask) -> bool {
@@ -247,6 +262,47 @@ pub fn process_init(vspace: *mut ()) -> usize {
     libvsched2::process_init(vspace)
 }
 
+/// 返回 StarryOS 专用 vVAR 中的共享任务表。
+///
+/// 用户任务以编码后的 [`UserTaskKey`] 进入 vsched2 用户调度器；共享表只保存
+/// 用户态和内核态共同可见的任务投影，内核任务对象仍由 registry 管理。
+pub fn shared_task_table() -> &'static SharedTaskTable {
+    &vdso::starry_vvar_data().task_table
+}
+
+/// 将用户任务及其共享的 [`crate::task::ProcessData`] 绑定到 [`process_init`] 返回的 ID。
+///
+/// 集中执行该操作，可以防止 Linux pid/tid 混入 vsched2 独立的 `PROCESS_INFO_TABLE` 命名空间。
+/// 返回旧绑定，供 `execve` 替换路径注销旧进程槽位。
+pub fn bind_user_process(
+    task: *const VschedTaskImpl,
+    raw_pid: usize,
+) -> Option<VschedProcessId> {
+    assert!(!task.is_null(), "bind_user_process: null task");
+    let pid = VschedProcessId::from_user_raw(raw_pid)
+        .expect("bind_user_process: process_init returned a reserved id");
+    let task = unsafe { &*task };
+    assert!(
+        !task.is_kernel.load(Ordering::Acquire),
+        "bind_user_process: kernel task cannot use a user process id",
+    );
+    let thread = task
+        .task
+        .try_as_thread()
+        .expect("bind_user_process: user task has no Thread data");
+    let old = thread.proc_data.replace_vsched_process_id(pid);
+    task.pid.store(pid.as_raw(), Ordering::Release);
+    if let Some(key) = task.shared_task_key() {
+        assert!(
+            shared_task_table().set_process_id(key, pid),
+            "bind_user_process: shared task is stale",
+        );
+    } else {
+        let _ = register_user_task(task, pid);
+    }
+    old
+}
+
 pub fn process_drop(pid: usize) {
     libvsched2::process_drop(pid)
 }
@@ -256,11 +312,19 @@ pub fn user_init_with_vspace(vspace: *mut ()) {
 }
 
 pub fn push_task_into_process(task: *const (), pid: usize) -> bool {
+    let task = with_vsched_task(task, |task| task.task_id())
+        .flatten()
+        .unwrap_or(task);
     libvsched2::push_task_into_process(task, pid)
 }
 
 pub fn map_vdso_for_child(vspace: *mut ()) -> usize {
     vdso::map_so(vspace as usize) as usize
+}
+
+/// 将 StarryOS 专用 vDSO 映射到子地址空间，返回其代码基址。
+pub fn map_starry_vdso_for_child(vspace: *mut ()) -> usize {
+    vdso::map_starry_vsched_so(vspace as usize)
 }
 
 pub fn current_task_ptr() -> *const () {
@@ -274,14 +338,10 @@ pub fn current_task_ptr() -> *const () {
 /// current generation.
 pub fn current_block_on_task() -> (*const (), usize) {
     let task = current_task_ptr();
-    if task.is_null() {
-        return (core::ptr::null(), 0);
-    }
-    let task_impl = unsafe { &*(task as *const task::VschedTaskImpl) };
-    (
-        task,
-        task_impl.wake_generation.load(Ordering::Acquire),
-    )
+    with_vsched_task(task, |task_impl| {
+        (task, task_impl.wake_generation.load(Ordering::Acquire))
+    })
+    .unwrap_or((core::ptr::null(), 0))
 }
 
 /// Starts or cancels the task-state part of a block_on operation.
@@ -292,72 +352,69 @@ pub fn current_block_on_task() -> (*const (), usize) {
 /// a task that is already safe to change from Blocking/Blocked to Ready.
 pub fn transition_block_on_task(blocking: bool) -> bool {
     let task = current_task_ptr();
-    if task.is_null() {
-        return false;
-    }
-    let task_impl = unsafe { &*(task as *const task::VschedTaskImpl) };
-    use libvsched2::{Task as _, TaskState};
-    let previous = if blocking {
-        task_impl.match_set_state(
-            TaskState::Ready,
-            TaskState::Blocking,
-            TaskState::Blocked,
-            TaskState::Exited,
-            TaskState::Blocking,
-        )
-    } else {
-        task_impl.match_set_state(
-            TaskState::Ready,
-            TaskState::Running,
-            TaskState::Blocked,
-            TaskState::Exited,
-            TaskState::Running,
-        )
-    };
-    match (blocking, previous) {
-        (true, TaskState::Running) | (false, TaskState::Blocking) => true,
-        (_, TaskState::Exited) => false,
-        (_, state) => panic!(
-            "block_on: invalid task state transition, blocking={blocking}, previous={state:?}"
-        ),
-    }
+    with_vsched_task(task, |task_impl| {
+        use libvsched2::{Task as _, TaskState};
+        let previous = if blocking {
+            task_impl.match_set_state(
+                TaskState::Ready,
+                TaskState::Blocking,
+                TaskState::Blocked,
+                TaskState::Exited,
+                TaskState::Blocking,
+            )
+        } else {
+            task_impl.match_set_state(
+                TaskState::Ready,
+                TaskState::Running,
+                TaskState::Blocked,
+                TaskState::Exited,
+                TaskState::Running,
+            )
+        };
+        match (blocking, previous) {
+            (true, TaskState::Running) | (false, TaskState::Blocking) => true,
+            (_, TaskState::Exited) => false,
+            (_, state) => panic!(
+                "block_on: invalid task state transition, blocking={blocking}, previous={state:?}"
+            ),
+        }
+    })
+    .unwrap_or(false)
 }
 
 pub fn wake_blocked_task(task: *const (), generation: usize) -> bool {
-    if task.is_null() {
-        return false;
-    }
-    let task_impl = unsafe { &*(task as *const task::VschedTaskImpl) };
-    use libvsched2::{Task as _, TaskState};
-    if task_impl.wake_generation.load(Ordering::Acquire) != generation {
-        return false;
-    }
-    let previous = task_impl.match_set_state(
-        TaskState::Ready,
-        TaskState::Running,
-        TaskState::Ready,
-        TaskState::Exited,
-        TaskState::Ready,
-    );
-    match previous {
-        TaskState::Blocked => {
-            // This transition is the unique owner of queue insertion.  A
-            // second Waker observes Ready and does nothing.  Rolling Ready
-            // back to Blocked on failure would lose a concurrent notification,
-            // so queue exhaustion is an explicit fatal invariant violation.
-            assert!(
-                libvsched2::push_task(task),
-                "wake_blocked_task: ready queue is full"
-            );
-            true
+    let result = with_vsched_task(task, |task_impl| {
+        use libvsched2::{Task as _, TaskState};
+        if task_impl.wake_generation.load(Ordering::Acquire) != generation {
+            return (false, false);
         }
-        // A wake racing with context save changes Blocking to Ready.  The
-        // vsched2 thread-entry path observes Ready and performs the enqueue
-        // after the context is safe to resume.
-        TaskState::Blocking => true,
-        TaskState::Ready => true,
-        TaskState::Running | TaskState::Exited => false,
+        let previous = task_impl.match_set_state(
+            TaskState::Ready,
+            TaskState::Running,
+            TaskState::Ready,
+            TaskState::Exited,
+            TaskState::Ready,
+        );
+        match previous {
+            TaskState::Blocked => (true, true),
+            // A wake racing with context save changes Blocking to Ready.  The
+            // vsched2 thread-entry path observes Ready and performs the enqueue
+            // after the context is safe to resume.
+            TaskState::Blocking => (true, false),
+            TaskState::Ready => (true, false),
+            TaskState::Running | TaskState::Exited => (false, false),
+        }
+    })
+    .unwrap_or((false, false));
+    if result.1 {
+        // 状态转换已经完成，此处必须在 registry 锁外进入 Task VTABLE。
+        // 第二个 Waker 会观察到 Ready，不会重复入队。
+        assert!(
+            libvsched2::push_task(task),
+            "wake_blocked_task: ready queue is full"
+        );
     }
+    result.0
 }
 
 pub fn set_current_task_ptr(task: *const ()) {
@@ -372,12 +429,12 @@ pub fn set_trapped_vsched_task(task: *const ()) {
 
 /// 读取当前被 trap_handler 服务的用户任务（不被 CURRENT_TASK 影响）。
 pub fn trapped_vsched_task() -> *const () {
-    let current = current_task_ptr() as *const task::VschedTaskImpl;
-    if !current.is_null() {
-        let owner = unsafe { &*current }.trap_owner.load(Ordering::Acquire);
-        if owner != 0 {
-            return owner as *const ();
-        }
+    let current = current_task_ptr();
+    if let Some(owner) = with_vsched_task(current, |task| {
+        task.trap_owner.load(Ordering::Acquire)
+    }) && owner != 0
+    {
+        return owner as *const ();
     }
     TRAPPED_VSCHED_TASK[<smp::VschedSmpImpl as libvsched2::SMP>::cpu_id()]
         .load(Ordering::Acquire) as *const ()
@@ -402,19 +459,24 @@ pub fn alloc_stack() -> *mut () {
 
 /// 标记 vsched2 任务为 Exited，让 trap_handler 不再将其推回调度器
 pub fn set_vsched_task_exited(task: *const ()) {
-    let vti = unsafe { &*(task as *const task::VschedTaskImpl) };
-    use libvsched2::Task;
-    vti.wake_generation.fetch_add(1, Ordering::AcqRel);
-    vti.set_state(libvsched2::TaskState::Exited);
+    with_vsched_task(task, |vti| {
+        use libvsched2::Task;
+        vti.wake_generation.fetch_add(1, Ordering::AcqRel);
+        vti.set_state(libvsched2::TaskState::Exited);
+    })
+    .expect("set_vsched_task_exited: unknown vsched2 task pointer");
 
     // The legacy startup path joins the initial userspace task and then powers
     // off in `main`.  The vsched2 bootstrap is a non-returning scheduler root,
     // so perform the equivalent lifecycle transition once the same task has
     // committed Exited.  Child-process exits must continue through wait4 and
     // therefore must not reach this branch.
+    let task_id = with_vsched_task(task, |task| task.task_id())
+        .flatten()
+        .unwrap_or(task);
     if VSCHED2_INIT_TASK
         .compare_exchange(
-            task as usize,
+            task_id as usize,
             0,
             Ordering::AcqRel,
             Ordering::Acquire,
@@ -469,11 +531,6 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace: Option<*mut (
 
     if let Some(init_task_ptr) = init_task_ptr {
         assert!(!init_task_ptr.is_null(), "vsched2 init task is null");
-        assert_eq!(
-            VSCHED2_INIT_TASK.swap(init_task_ptr as usize, Ordering::AcqRel),
-            0,
-            "vsched2 init task was registered twice",
-        );
     }
 
     if let (Some(init_task_ptr), Some(aspace_ptr)) = (init_task_ptr, vspace) {
@@ -499,13 +556,22 @@ pub fn vsched2_bootstrap(init_task_ptr: Option<*const ()>, vspace: Option<*mut (
         }
 // axlog::ax_println!("vsched2: process_init pid={}", pid);
         let pid = libvsched2::process_init(aspace_ptr);
+        bind_user_process(init_task_ptr as *const VschedTaskImpl, pid);
+        let init_task_id = with_vsched_task(init_task_ptr, |task| task.task_id())
+            .flatten()
+            .expect("vsched2 init task has no task id");
+        assert_eq!(
+            VSCHED2_INIT_TASK.swap(init_task_id as usize, Ordering::AcqRel),
+            0,
+            "vsched2 init task was registered twice",
+        );
 // axlog::ax_println!("[verify] vdso_pa={:#x} user_vdso_base={:#x}",
         // --- Verification ---
         // user_init must run with the user PT active so that &USER_SCHEDULER
         // inside init_sources resolves to the user vDSO copy.  We call
         // user_init_with_vspace which translates the address to kva.
         libvsched2::user_init(aspace_ptr);
-        libvsched2::push_task_into_process(init_task_ptr, pid);
+        push_task_into_process(init_task_ptr, pid);
         unsafe {
             asm::write_user_page_table(kernel_root);
             asm::flush_tlb(None);

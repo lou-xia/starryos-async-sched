@@ -22,6 +22,8 @@ pub struct AddrSpace {
     pt: PageTable,
     /// vDSO 在此地址空间中的虚拟基址。进程创建时设置。
     pub vdso_base: usize,
+    /// StarryOS 专用 vDSO 在此地址空间中的虚拟基址。
+    pub starry_vdso_base: usize,
 }
 
 impl AddrSpace {
@@ -67,6 +69,7 @@ impl AddrSpace {
             areas: MemorySet::new(),
             pt: PageTable::try_new().map_err(|_| AxError::NoMemory)?,
             vdso_base: 0,
+            starry_vdso_base: 0,
         })
     }
 
@@ -281,6 +284,7 @@ impl AddrSpace {
         // non-zero base that points at an unmapped region while a new image is
         // being loaded or after loading fails.
         self.vdso_base = 0;
+        self.starry_vdso_base = 0;
     }
 
     /// Checks whether an access to the specified memory region is valid.
@@ -383,6 +387,7 @@ impl AddrSpace {
         // Preserve its base metadata as well so callers can find or replace
         // that region before installing a private child copy.
         guard.vdso_base = self.vdso_base;
+        guard.starry_vdso_base = self.starry_vdso_base;
 
         let mut self_modify = self.pt.modify();
         for area in self.areas.iter() {

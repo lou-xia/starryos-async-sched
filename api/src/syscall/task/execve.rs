@@ -73,11 +73,11 @@ pub fn sys_execve(
                         riscv::register::sstatus::set_sum();
                     }
                 }
-                let trapped = starry_core::vsched::trapped_vsched_task()
-                    as *const starry_core::vsched::task::VschedTaskImpl;
-                assert!(!trapped.is_null(), "execve: no trapped vsched task");
+                // 用户任务使用编码 ID，访问内核字段前必须先解析为任务对象。
+                let trapped_id = starry_core::vsched::trapped_vsched_task();
+                let trapped = starry_core::vsched::direct_task(trapped_id)
+                    .expect("execve: no trapped vsched task");
                 let task = unsafe { &*trapped };
-                let old_pid = task.pid.load(core::sync::atomic::Ordering::Acquire);
                 let new_vdso_base = aspace.vdso_base;
                 assert_ne!(
                     new_vdso_base, 0,
@@ -91,9 +91,9 @@ pub fn sys_execve(
                     core::sync::atomic::Ordering::Release,
                 );
                 let new_pid = starry_core::vsched::process_init(vspace);
+                let old_pid = starry_core::vsched::bind_user_process(trapped, new_pid)
+                    .expect("execve: current process has no previous vsched binding");
                 starry_core::vsched::user_init_with_vspace(vspace);
-                task.pid
-                    .store(new_pid, core::sync::atomic::Ordering::Release);
                 axlog::info!(
                     "[vsched2-diag] execve vDSO task={} aspace_vdso={:#x} task_vdso={:#x}",
                     task.task.id_name(),
@@ -101,8 +101,12 @@ pub fn sys_execve(
                     task.user_vdso_base
                         .load(core::sync::atomic::Ordering::Acquire),
                 );
-                starry_core::vsched::process_drop(old_pid);
-                axlog::info!("[execve] vsched pid {} -> {}", old_pid, new_pid);
+                starry_core::vsched::process_drop(old_pid.as_raw());
+                axlog::info!(
+                    "[execve] vsched pid {} -> {}",
+                    old_pid.as_raw(),
+                    new_pid,
+                );
                 if root.as_usize() != 0 && root != kernel_root {
                     unsafe {
                         axhal::asm::write_user_page_table(kernel_root);

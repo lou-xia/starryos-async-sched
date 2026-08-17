@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 libvsched2 = { path = "../vdso_vsched2_output/libvsched2" }
+libstarry_vsched = { path = "../vdso_starry_vsched_output/libstarry_vsched" }
 crate_interface = "0.2.0"
 axmm.workspace = true
 axhal.workspace = true

@@ -1,6 +1,6 @@
 use core::arch::global_asm;
 
-use super::{task::VschedTaskImpl, trapframe::UserTrapFrame};
+use super::{task::VschedTaskImpl, trapframe::UserTrapFrame, with_vsched_task};
 
 global_asm!(
     r#"
@@ -182,13 +182,11 @@ extern "C" fn vsched2_trap_entry_stub(
     if task_ptr.is_null() {
         task_ptr = libvsched2::current_task_ptr();
     }
-    if !task_ptr.is_null() {
-        let vti = unsafe { &*(task_ptr as *const VschedTaskImpl) };
+    with_vsched_task(task_ptr, |vti| {
         if trap_type == 1 {
-            // 根协程被 IRQ 打断后必须先保留它正在使用的 current_stack。
-            // vsched2 随后仍按原有 IRQ 栈协议使用 sscratch 中的 trap 栈；
-            // 该任务则以线程形式恢复被打断的 poll continuation。
-            vti.promote_interrupted_kernel_coroutine();
+            // 根协程需要保存 poll continuation；调度器等待上下文则需要在每次
+            // WFI 中断时交出本轮调度栈。两者都必须先于 vsched2 锁定栈管理器。
+            vti.prepare_interrupted_kernel_context();
         }
         // A reusable handler may trap while executing in a user task's
         // axtask/ActiveScope context. Release that per-CPU context before the
@@ -199,7 +197,7 @@ extern "C" fn vsched2_trap_entry_stub(
         // Pending TrapInfo会长期持有该任务的trap frame。全局循环缓冲会被其它
         // 任务的后续trap覆盖，因此必须保存到每个任务独占且地址稳定的frame中。
         save_task_trap_frame(vti, tf_stack);
-    }
+    });
 
     let entry = unsafe {
         libvsched2::VDSO_VTABLE
@@ -257,8 +255,7 @@ unsafe extern "C" fn vsched_yield_trampoline() -> ! {
 #[unsafe(no_mangle)]
 extern "C" fn vsched_yield_entry_stub(tf_stack: *const UserTrapFrame) -> ! {
     let current_task = libvsched2::current_task_ptr();
-    if !current_task.is_null() {
-        let vti = unsafe { &*(current_task as *const VschedTaskImpl) };
+    with_vsched_task(current_task, |vti| {
         // A Thread extension owns the active scope read guard.  Release it
         // before the external scheduler switches away; restore_context or
         // the next coroutine poll acquires it again for the resumed task.
@@ -285,13 +282,20 @@ extern "C" fn vsched_yield_entry_stub(tf_stack: *const UserTrapFrame) -> ! {
         if !vti.is_coroutine.load(core::sync::atomic::Ordering::Acquire) {
             vti.detach_thread_stack_for_resched();
         }
-    }
+    });
 
     let entry = unsafe {
         libvsched2::VDSO_VTABLE
             .raw_thread_entry
             .expect("raw_thread_entry not in vtable")
     };
+
+    // raw_thread_entry 是调度器入口，vsched2 明确要求进入时关闭本地中断。TrapHandler 协程
+    // 恢复自身 SIE 状态后仍可能调用 yield_now()，例如唤醒 futex 等待者之后，因此在此统一满足
+    // 入口约定。协程原有的 IRQ 状态会在下次 poll 前由 IrqCorotineWrapper 恢复，无需增加新的
+    // 调度器状态或 vDSO 接口。
+    use kernel_guard::{BaseGuard, IrqSave};
+    let _previous_irq_state = IrqSave::acquire();
     entry();
 }
 

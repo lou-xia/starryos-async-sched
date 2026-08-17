@@ -23,7 +23,7 @@ use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
 use ouroboros::self_referencing;
 use starry_vm::{VmError, VmIo, VmResult};
 use uluru::LRUCache;
-use vdso::map_so;
+use vdso::{map_so, map_starry_vsched_so};
 
 use crate::{
     config::{USER_SPACE_BASE, USER_SPACE_SIZE},
@@ -342,6 +342,8 @@ pub fn load_user_app(
     let uspace_ptr = uspace as *mut _ as usize;
     let vdso_start = VirtAddr::from(map_so(uspace_ptr) as usize);
     uspace.vdso_base = vdso_start.as_usize();
+    let starry_vdso_start = VirtAddr::from(map_starry_vsched_so(uspace_ptr));
+    uspace.starry_vdso_base = starry_vdso_start.as_usize();
 
     // Pre-populate VDSO BSS areas (new_alloc backend) to avoid page faults
     {
@@ -360,6 +362,8 @@ pub fn load_user_app(
     }
 
     auxv.push(AuxEntry::new(AuxType::SYSINFO_EHDR, vdso_start.into()));
+    // AT_SYSINFO 保留给 StarryOS 专用 vDSO，避免改变现有 vsched2 vDSO 的语义。
+    auxv.push(AuxEntry::new(AuxType::SYSINFO, starry_vdso_start.into()));
 
     let stack_data = app_stack_region(args, envs, &auxv, ustack_top.into());
     let user_sp = ustack_top - stack_data.len();

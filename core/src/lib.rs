@@ -7,7 +7,6 @@
 
 extern crate alloc;
 
-extern crate libvqueue;
 extern crate libvsched2;
 
 #[macro_use]

@@ -1,7 +1,7 @@
 use core::sync::atomic::Ordering;
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axtask::current;
+use axtask::{current, vsched2_active};
 use linux_raw_sys::general::{
     FUTEX_CMD_MASK, FUTEX_CMP_REQUEUE, FUTEX_REQUEUE, FUTEX_WAIT, FUTEX_WAIT_BITSET, FUTEX_WAKE,
     FUTEX_WAKE_BITSET, robust_list_head, timespec,
@@ -90,7 +90,12 @@ pub fn sys_futex(
                 };
                 count = futex.wq.wake(value as _, bitset);
             }
-            axtask::yield_now();
+            // AxRunQueue 在唤醒等待者后使用这次让权改善公平性。在 vsched2 中，handler 若未先
+            // 提交 Ready 就主动让权，会从 Running 变为 Blocked，导致当前系统调用无法完成；
+            // pthread 也就不能继续执行 exit/clear_child_tid。
+            if !vsched2_active() {
+                axtask::yield_now();
+            }
             Ok(count as _)
         }
         FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {

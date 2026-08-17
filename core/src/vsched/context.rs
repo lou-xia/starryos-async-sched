@@ -7,7 +7,7 @@ use axmm::AddrSpace;
 use libvsched2;
 use memory_addr::PhysAddr;
 
-use super::{task::VschedTaskImpl, trapframe::UserTrapFrame};
+use super::{trapframe::UserTrapFrame, with_vsched_task};
 
 pub struct VschedContextImpl;
 pub struct VschedVSpaceImpl;
@@ -101,12 +101,10 @@ impl libvsched2::Context for VschedContextImpl {
         let offset = RAW_RUN_TASK_OFFSET.load(Ordering::Acquire);
         assert_ne!(offset, 0, "into_user: raw_run_task offset not initialized");
         let current_task = libvsched2::current_task_ptr();
-        let user_vdso_base = if !current_task.is_null() {
-            let vti = unsafe { &*(current_task as *const VschedTaskImpl) };
+        let user_vdso_base = with_vsched_task(current_task, |vti| {
             vti.user_vdso_base.load(Ordering::Acquire)
-        } else {
-            0
-        };
+        })
+        .unwrap_or(0);
         assert_ne!(
             user_vdso_base, 0,
             "into_user: user_vdso_base not set, did mm.rs call set_process_vdso_base?"
@@ -134,29 +132,34 @@ impl libvsched2::Context for VschedContextImpl {
 
     fn into_user_context(task: *const ()) {
         assert!(!task.is_null(), "into_user_context: task is null");
-        let vsched_task = unsafe { &*(task as *const VschedTaskImpl) };
-        let tf_ptr = vsched_task.trap_frame.load(Ordering::Acquire);
+        let tf_ptr = with_vsched_task(task, |vsched_task| {
+            vsched_task.trap_frame.load(Ordering::Acquire)
+        })
+        .expect("into_user_context: task is not a vsched2 task");
         assert_ne!(tf_ptr, 0, "into_user_context: trap_frame is null");
         let tf = unsafe { &*(tf_ptr as *const UserTrapFrame) };
         if tf.scause == 0 {
-            axlog::info!(
-                "[vsched2-diag] initial user restore task={:#x} axid={} name={} pid={} tf={:#x} satp={:#x} expected_root={:#x} vspace={:#x} vdso={:#x} sepc={:#x} sp={:#x} gp={:#x} tp={:#x} a0={:#x} sstatus={:#x}",
-                task as usize,
-                vsched_task.task.id().as_u64(),
-                vsched_task.task.name(),
-                vsched_task.pid.load(Ordering::Acquire),
-                tf_ptr,
-                axhal::asm::read_user_page_table().as_usize(),
-                vsched_task.user_page_table_root.load(Ordering::Acquire),
-                vsched_task.user_aspace_ptr.load(Ordering::Acquire),
-                vsched_task.user_vdso_base.load(Ordering::Acquire),
-                tf.sepc,
-                tf.regs.sp,
-                tf.regs.gp,
-                tf.regs.tp,
-                tf.regs.a0,
-                tf.sstatus,
-            );
+            with_vsched_task(task, |vsched_task| {
+                axlog::info!(
+                    "[vsched2-diag] initial user restore task={:#x} axid={} name={} pid={} tf={:#x} satp={:#x} expected_root={:#x} vspace={:#x} vdso={:#x} sepc={:#x} sp={:#x} gp={:#x} tp={:#x} a0={:#x} sstatus={:#x}",
+                    task as usize,
+                    vsched_task.task.id().as_u64(),
+                    vsched_task.task.name(),
+                    vsched_task.pid.load(Ordering::Acquire),
+                    tf_ptr,
+                    axhal::asm::read_user_page_table().as_usize(),
+                    vsched_task.user_page_table_root.load(Ordering::Acquire),
+                    vsched_task.user_aspace_ptr.load(Ordering::Acquire),
+                    vsched_task.user_vdso_base.load(Ordering::Acquire),
+                    tf.sepc,
+                    tf.regs.sp,
+                    tf.regs.gp,
+                    tf.regs.tp,
+                    tf.regs.a0,
+                    tf.sstatus,
+                );
+            })
+            .expect("into_user_context: task is not a vsched2 task");
         }
         let spp = (tf.sstatus >> 8) & 1;
         // axlog::ax_println!(

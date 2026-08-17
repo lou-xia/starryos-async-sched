@@ -122,7 +122,9 @@ fn create_vsched_init_task(args: &[String], envs: &[String]) -> (*const starry_c
     let vti = starry_core::vsched::register_task(
         task_ref.clone(),
         0,
-        1,
+        // 真正的 vsched2 进程表索引会在 bootstrap 阶段由 process_init() 分配，不能使用
+        // Linux pid 代替。
+        starry_core::vsched::VSCHED_INVALID_PROCESS_ID,
         false,
         None,
         init_vdso_base,
@@ -142,6 +144,7 @@ fn main() {
     }
     starry_api::init();
     vdso::vdso_init();
+    vdso::starry_vsched_init();
 
     let args = CMDLINE
         .iter()

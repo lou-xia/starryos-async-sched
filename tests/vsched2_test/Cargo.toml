@@ -5,3 +5,7 @@ edition = "2024"
 
 [dependencies]
 libc = "0.2"
+libstarry_vsched = { path = "../../vdso_starry_vsched_output/libstarry_vsched" }
+libvsched2 = { path = "../../vdso_vsched2_output/libvsched2" }
+vsched-user = { path = "../../vsched_user" }
+vsched-abi = { path = "../../vsched_abi" }

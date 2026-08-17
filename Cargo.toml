@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["api", "core"]
+members = ["api", "core", "vsched_abi", "vsched_user"]
 exclude = [
     "arceos",
     "vdso_output/vdso_wrapper",
@@ -8,8 +8,9 @@ exclude = [
     "tests",
     "vdso_vsched2_output/vdso_wrapper",
     "vdso_vsched2_output/libvsched2",
-    "vdso_vqueue_output/vdso_wrapper",
-    "vdso_vqueue_output/libvqueue",
+    "vdso_starry_vsched_output/vdso_wrapper",
+    "vdso_starry_vsched_output/libstarry_vsched",
+    "starry_vsched_vdso",
 ]
 
 [workspace.package]
@@ -62,6 +63,7 @@ axtask = { path = "arceos/modules/axtask" }
 
 vdso_example = { path = "vdso_example" }
 vdso = { path = "vdso" }
+vsched-abi = { path = "vsched_abi" }
 
 axbacktrace = "0.1"
 axerrno = "0.2"

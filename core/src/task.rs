@@ -29,6 +29,7 @@ use starry_signal::{
     SignalInfo, Signo,
     api::{ProcessSignalManager, SignalActions, ThreadSignalManager},
 };
+use vsched_abi::{VSCHED_INVALID_PROCESS_ID, VschedProcessId};
 use weak_map::WeakMap;
 
 pub use self::stat::TaskStat;
@@ -199,6 +200,11 @@ pub struct ProcessData {
     /// The virtual memory address space.
     // TODO: scopify
     pub aspace: Arc<Mutex<AddrSpace>>,
+    /// `vsched2::process_init()` 为该地址空间返回的索引。
+    ///
+    /// 该索引与 Linux pid/tgid 命名空间严格区分。共享此 `ProcessData` 的所有线程也共享同一个
+    /// vsched2 用户调度器，因此继承完全相同的值。
+    vsched_process_id: AtomicUsize,
     /// The resource scope
     pub scope: RwLock<Scope>,
     /// The user heap top
@@ -239,6 +245,7 @@ impl ProcessData {
             exe_path: RwLock::new(exe_path),
             cmdline: RwLock::new(cmdline),
             aspace,
+            vsched_process_id: AtomicUsize::new(VSCHED_INVALID_PROCESS_ID),
             scope: RwLock::new(Scope::new()),
             heap_top: AtomicUsize::new(crate::config::USER_HEAP_BASE),
 
@@ -267,6 +274,36 @@ impl ProcessData {
     /// Set the top address of the user heap.
     pub fn set_heap_top(&self, top: usize) {
         self.heap_top.store(top, Ordering::Release)
+    }
+
+    /// 返回绑定到该地址空间的 vsched2 进程表索引。
+    pub fn vsched_process_id(&self) -> Option<VschedProcessId> {
+        VschedProcessId::from_user_raw(self.vsched_process_id.load(Ordering::Acquire))
+    }
+
+    /// 发布 `vsched2::process_init()` 返回的进程表索引。
+    ///
+    /// `execve` 会替换地址空间本地的 vDSO，因此必须在同一操作中替换该 ID。函数返回旧 ID，
+    /// 以便随后释放对应的 vsched2 进程槽位。
+    pub fn replace_vsched_process_id(
+        &self,
+        id: VschedProcessId,
+    ) -> Option<VschedProcessId> {
+        assert!(id.is_user(), "cannot bind a non-user vsched process id");
+        let old = self
+            .vsched_process_id
+            .swap(id.as_raw(), Ordering::AcqRel);
+        VschedProcessId::from_user_raw(old)
+    }
+
+    /// 移除并返回当前的 vsched2 进程表索引。
+    ///
+    /// 最后一个退出线程通过该操作保证进程槽位最多释放一次。
+    pub fn take_vsched_process_id(&self) -> Option<VschedProcessId> {
+        let old = self
+            .vsched_process_id
+            .swap(VSCHED_INVALID_PROCESS_ID, Ordering::AcqRel);
+        VschedProcessId::from_user_raw(old)
     }
 
     /// Linux manual: A "clone" child is one which delivers no signal, or a

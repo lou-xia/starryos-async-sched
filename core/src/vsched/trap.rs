@@ -9,7 +9,7 @@ use kernel_guard::{BaseGuard, IrqSave};
 use libvsched2::{self, SMP, Task};
 
 use super::{
-    HIGHEST_PRIORITY, register_task,
+    HIGHEST_PRIORITY, direct_task, register_task, with_vsched_task,
     task::{CoroutinePoll, VschedTaskImpl},
     trapframe::UserTrapFrame,
 };
@@ -29,12 +29,12 @@ pub fn set_last_trapped_user_task(task: *const ()) {
 }
 
 pub fn get_last_trapped_user_task() -> *const VschedTaskImpl {
-    let current = libvsched2::current_task_ptr() as *const VschedTaskImpl;
-    if !current.is_null() {
-        let owner = unsafe { &*current }.trap_owner.load(Ordering::Acquire);
-        if owner != 0 {
-            return owner as *const VschedTaskImpl;
-        }
+    let current = libvsched2::current_task_ptr();
+    if let Some(owner) = with_vsched_task(current, |task| {
+        task.trap_owner.load(Ordering::Acquire)
+    }) && owner != 0
+    {
+        return direct_task(owner as *const ()).unwrap_or(core::ptr::null());
     }
     LAST_TRAPPED_USER_TASK[<super::smp::VschedSmpImpl as SMP>::cpu_id()].load(Ordering::Acquire)
         as *const VschedTaskImpl
@@ -59,11 +59,17 @@ fn effective_user_owner(mut task: *const VschedTaskImpl) -> Option<*const Vsched
         if task.is_null() {
             return None;
         }
-        let vti = unsafe { &*task };
-        if !vti.is_kernel() {
+        let (is_kernel, owner) = with_vsched_task(task as *const (), |vti| {
+            (
+                vti.is_kernel(),
+                direct_task(vti.trap_owner.load(Ordering::Acquire) as *const ())
+                    .unwrap_or(core::ptr::null()),
+            )
+        })?;
+        if !is_kernel {
             return Some(task);
         }
-        task = vti.trap_owner.load(Ordering::Acquire) as *const VschedTaskImpl;
+        task = owner;
     }
     panic!("trap owner chain is cyclic or too deep");
 }
@@ -81,8 +87,8 @@ pub struct VschedTrapInfoImpl {
 
 impl libvsched2::TrapInfo for VschedTrapInfoImpl {
     fn from_task(task: *const ()) -> *const Self {
-        let vti = unsafe { &*(task as *const VschedTaskImpl) };
-        let tf_ptr = vti.trap_frame.load(Ordering::Acquire);
+        let tf_ptr = with_vsched_task(task, |vti| vti.trap_frame.load(Ordering::Acquire))
+            .expect("TrapInfo::from_task: task is not a vsched2 task");
         assert_ne!(tf_ptr, 0, "TrapInfo::from_task: task has no trap frame");
         let frame = unsafe { *(tf_ptr as *const UserTrapFrame) };
         Box::into_raw(Box::new(Self {
@@ -97,12 +103,12 @@ impl libvsched2::TrapInfo for VschedTrapInfoImpl {
             return;
         }
         // `task` is authoritative: vsched2 passes None for external interrupts.
-        let trapped = task.map(|ptr| ptr as *const VschedTaskImpl);
+        let trapped = task.and_then(direct_task);
         let owner = trapped.and_then(effective_user_owner);
-        let handler = libvsched2::current_task_ptr() as *const VschedTaskImpl;
+        let handler = libvsched2::current_task_ptr();
         if let Some(owner) = owner {
-            assert!(!handler.is_null(), "TrapInfo::handle: no current handler");
-            unsafe { &*handler }.bind_execution_task(owner);
+            with_vsched_task(handler, |handler| handler.bind_execution_task(owner))
+                .expect("TrapInfo::handle: no current handler");
         }
         let dispatcher: TrapDispatcher = unsafe { core::mem::transmute(dispatcher) };
         let is_external_irq = self.frame.scause == 0x8000000000000009;
@@ -134,7 +140,8 @@ impl libvsched2::TrapInfo for VschedTrapInfoImpl {
             }
         }
         if owner.is_some() {
-            unsafe { &*handler }.unbind_execution_task();
+            with_vsched_task(handler, |handler| handler.unbind_execution_task())
+                .expect("TrapInfo::handle: no current handler");
         }
     }
 
@@ -145,6 +152,9 @@ impl libvsched2::TrapInfo for VschedTrapInfoImpl {
 
     // axlog::ax_println!("[new_handler] START queue={:#x}", queue as usize);
     fn new_handler(queue: *const ()) -> *const () {
+        // 新版 vsched2 以空参数请求每核专用的调度器等待上下文；非空参数
+        // 仍表示可运行的 TrapHandler。两者都不会进入 AxRunQueue。
+        let is_scheduler_wait_context = queue.is_null();
         let handler_fn = unsafe {
             libvsched2::VDSO_VTABLE
                 .trap_handler
@@ -153,7 +163,11 @@ impl libvsched2::TrapInfo for VschedTrapInfoImpl {
         };
         let task_ref = axtask::new_raw(
             || {},
-            alloc::string::String::from("trap_handler"),
+            alloc::string::String::from(if is_scheduler_wait_context {
+                "scheduler_wait_context"
+            } else {
+                "trap_handler"
+            }),
             config::KERNEL_STACK_SIZE,
             // axlog::ax_println!("[new_handler] axtask::new_raw done");
         );
@@ -165,6 +179,9 @@ impl libvsched2::TrapInfo for VschedTrapInfoImpl {
         });
         // axlog::ax_println!("[new_handler] DONE ptr={:#x}", ptr as usize);
         let ptr = register_task(task_ref, HIGHEST_PRIORITY, 0, true, Some(coro), 0);
+        if is_scheduler_wait_context {
+            unsafe { &*ptr }.mark_scheduler_wait_context();
+        }
         ptr as *const ()
     }
 }
@@ -203,32 +220,28 @@ impl CoroutinePoll for TrapHandlerCoroutine {
 ///
 /// 第二次调用发生在原线程栈恢复后：任务恢复协程态，使下一次调度按根 Future poll 路径处理。
 pub fn toggle_handler(promote: bool) -> bool {
-    let ptr = libvsched2::current_task_ptr() as *const super::VschedTaskImpl;
-    if ptr.is_null() {
-        return false;
-    }
-    let vti = unsafe { &*ptr };
-
-    let is_coro = vti.is_coroutine.load(Ordering::Acquire);
-    if promote {
-        if !is_coro {
-            // Ordinary vsched2 threads already own a persistent stack and do
-            // not need a coroutine conversion around block_on.
-            return false;
+    let ptr = libvsched2::current_task_ptr();
+    with_vsched_task(ptr, |vti| {
+        let is_coro = vti.is_coroutine.load(Ordering::Acquire);
+        if promote {
+            if !is_coro {
+                // 普通 vsched2 线程已经拥有持久栈，不需要为 block_on 转换协程身份。
+                return false;
+            }
+            // transition_block_on_task() 已提交 Blocking；统一让权入口会在保存上下文后
+            // 交出协程栈，之后再由 vsched2 将状态提交为 Blocked。
+            vti.set_coroutine(false);
+            axlog::info!("[block_on] coroutine -> thread task={:#x}", ptr as usize);
+            true
+        } else {
+            if is_coro {
+                return false;
+            }
+            vti.set_coroutine(true);
+            vti.thread_stack_ptr.store(0, Ordering::Release);
+            axlog::info!("[block_on] thread -> coroutine task={:#x}", ptr as usize);
+            true
         }
-        // transition_block_on_task() has already committed Blocking.  vsched2
-        // will change it to Blocked only after the common yield entry has
-        // detached the continuation stack from this CPU.
-        vti.is_coroutine.store(false, Ordering::Release);
-        axlog::info!("[block_on] coroutine -> thread task={:#x}", ptr as usize);
-        true
-    } else {
-        if is_coro {
-            return false;
-        }
-        vti.is_coroutine.store(true, Ordering::Release);
-        vti.thread_stack_ptr.store(0, Ordering::Release);
-        axlog::info!("[block_on] thread -> coroutine task={:#x}", ptr as usize);
-        true
-    }
+    })
+    .unwrap_or(false)
 }

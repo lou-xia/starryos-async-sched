@@ -122,7 +122,13 @@ pub fn new_vsched_user_task(
 
     // Get proc_data from the Thread attached by sys_clone
     let thr = task_ref.try_as_thread().expect("vsched2 child must have thread");
-    let pid = thr.proc_data.proc.pid() as usize;
+    // Linux pid 不是 vsched2 的 PROCESS_INFO_TABLE 索引。CLONE_THREAD 子线程通过
+    // ProcessData 继承进程绑定；新 fork 的地址空间在 process_init() 前保持未绑定状态。
+    let vsched_pid = thr
+        .proc_data
+        .vsched_process_id()
+        .map(|pid| pid.as_raw())
+        .unwrap_or(starry_core::vsched::VSCHED_INVALID_PROCESS_ID);
     let user_root = thr.proc_data.aspace.lock().page_table_root().as_usize();
     let vdso_base = thr.proc_data.aspace.lock().vdso_base;
     assert_ne!(
@@ -149,7 +155,7 @@ pub fn new_vsched_user_task(
     let vti = starry_core::vsched::register_task(
         task_ref.clone(),
         0,
-        pid,
+        vsched_pid,
         false,
         None,
         vdso_base,
